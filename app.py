@@ -3,11 +3,13 @@ import pandas as pd
 import plotly.graph_objects as go
 import os
 import sqlite3 # Import the sqlite3 library
+import time # Used for generating unique IDs
+import numpy as np # Import numpy for pd.NA comparisons
 
 # --- Configuración Inicial ---
 st.set_page_config(layout="wide", page_title="Gestión de Equipos y Obras (Minería)")
 
-# --- Archivos de Datos (Ahora usaremos una base de datos SQLite) ---
+# --- Archivos de Datos (Usaremos una base de datos SQLite) ---
 DATA_DIR = "data"
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR)
@@ -15,6 +17,7 @@ if not os.path.exists(DATA_DIR):
 DATABASE_FILE = os.path.join(DATA_DIR, "app_data.db")
 
 # Define table names for SQLite
+TABLE_FLOTAS = "flotas" # New table for Fleets
 TABLE_EQUIPOS = "equipos"
 TABLE_CONSUMO = "consumo"
 TABLE_COSTOS_SALARIAL = "costos_salarial"
@@ -28,16 +31,26 @@ TABLE_ASIGNACION_MATERIALES = "asignacion_materiales"
 
 
 # --- Helper function to get SQLite connection ---
+@st.cache_resource # Cache the database connection to avoid reconnecting on each rerun
 def get_db_conn():
     """Establece y retorna una conexión a la base de datos SQLite."""
-    conn = sqlite3.connect(DATABASE_FILE)
+    # Permite que la conexión sea utilizada desde diferentes hilos.
+    # Esto es necesario para evitar el error "SQLite objects created in a thread..."
+    # en entornos como Streamlit.
+    # Es importante manejar la concurrencia si múltiples procesos Streamlit acceden al mismo archivo DB.
+    # Para un solo usuario o sesiones aisladas por proceso, esto es generalmente seguro.
+    conn = sqlite3.connect(DATABASE_FILE, check_same_thread=False)
+    # Opcional: Deshabilitar el auto-commit por defecto y manejar las transacciones
+    # manualmente con conn.commit() y conn.rollback() es más seguro para la integridad.
+    # conn.isolation_level = None
+
     return conn
 
 # --- Define expected columns and their pandas dtypes for each table ---
 # This is used to create empty dataframes if tables don't exist and for date handling
-# Use 'object' for dates initially, then convert to datetime/date after loading
 TABLE_COLUMNS = {
-    TABLE_EQUIPOS: {'Interno': 'object', 'Patente': 'object'},
+    TABLE_FLOTAS: {'ID_Flota': 'object', 'Nombre_Flota': 'object'},
+    TABLE_EQUIPOS: {'Interno': 'object', 'Patente': 'object', 'ID_Flota': 'object'}, # Added ID_Flota to Equipos
     TABLE_CONSUMO: {'Interno': 'object', 'Fecha': 'object', 'Consumo_Litros': 'float64', 'Horas_Trabajadas': 'float64', 'Kilometros_Recorridos': 'float64'},
     TABLE_COSTOS_SALARIAL: {'Interno': 'object', 'Fecha': 'object', 'Monto_Salarial': 'float64'},
     TABLE_GASTOS_FIJOS: {'Interno': 'object', 'Fecha': 'object', 'Tipo_Gasto_Fijo': 'object', 'Monto_Gasto_Fijo': 'float64', 'Descripcion': 'object'},
@@ -52,98 +65,146 @@ TABLE_COLUMNS = {
 # Define which columns are dates and should be converted
 DATE_COLUMNS = {
     TABLE_CONSUMO: ['Fecha'],
-    TABLE_COSTOS_SALARIAL: ['Fecha'],
+    TABLE_COSTOS_SALARIAL: ['Fecha'], # Corrected typo
     TABLE_GASTOS_FIJOS: ['Fecha'],
     TABLE_GASTOS_MANTENIMIENTO: ['Fecha'],
     TABLE_PRECIOS_COMBUSTIBLE: ['Fecha'],
     TABLE_COMPRAS_MATERIALES: ['Fecha_Compra'],
     TABLE_ASIGNACION_MATERIALES: ['Fecha_Asignacion'],
-    # Proyectos and Equipos tables have no date columns to convert in this list
+    # Flotas, Equipos, Proyectos tables have no date columns to convert in this list
 }
 
 
 # --- Funciones para Cargar/Guardar Datos usando SQLite ---
 def load_table(db_file, table_name):
     """Carga datos de una tabla SQLite en un DataFrame."""
-    conn = None # Initialize connection to None
+    conn = get_db_conn() # Use cached connection
+    df = pd.DataFrame() # Initialize empty DataFrame
     try:
-        conn = get_db_conn()
-        # Check if table exists
         cursor = conn.cursor()
         cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table_name}';")
         table_exists = cursor.fetchone() is not None
 
+        expected_cols_dict = TABLE_COLUMNS.get(table_name, {})
+        expected_cols = list(expected_cols_dict.keys())
+
         if table_exists:
-            df = pd.read_sql_query(f'SELECT * FROM "{table_name}"', conn) # Quote table name just in case
-            # Convert date columns
+            df = pd.read_sql_query(f'SELECT * FROM "{table_name}"', conn)
+            # Ensure all expected columns are present, add missing ones
+            for col in expected_cols:
+                if col not in df.columns:
+                    # Add missing column with default value (e.g., pd.NA for object, 0 for numeric)
+                    df[col] = pd.NA if expected_cols_dict.get(col) == 'object' else 0 # Use .get() for safety
+
+
+            # Convert date columns after ensuring they exist
             if table_name in DATE_COLUMNS:
                 for col in DATE_COLUMNS[table_name]:
                     if col in df.columns:
                         # Convert potential strings/objects to datetime, then to date objects
                         # Use errors='coerce' to turn invalid dates into NaT
-                        df[col] = pd.to_datetime(df[col], errors='coerce').dt.date
-                        # Drop rows where date conversion failed (optional, but keeps data clean)
-                        df.dropna(subset=[col], inplace=True)
-            return df
-        else:
-            st.warning(f"La tabla '{table_name}' no existe en la base de datos. Creando DataFrame vacío con columnas esperadas.")
-            # Return empty DataFrame with expected columns and dtypes
-            expected_cols_types = TABLE_COLUMNS.get(table_name, {})
-            df = pd.DataFrame(columns=expected_cols_types.keys())
-            # Ensure correct dtypes for empty dataframe
-            for col, dtype in expected_cols_types.items():
-                 if col in df.columns:
-                     df[col] = df[col].astype(dtype)
+                        df[col] = pd.to_datetime(df[col], errors='coerce').dt.date # Convert to date objects
+                        # Handle NaT values after conversion - pandas operations might fail with NaT in date columns
+                        # Option 1: drop rows with NaT dates (be cautious)
+                        # df.dropna(subset=[col], inplace=True)
+                        # Option 2: fill NaT dates with a default value (e.g., None)
+                        df[col] = df[col].where(pd.notna(df[col]), None) # Replace NaT with None
 
-            # If it's a date column in an empty df, the dtype might be 'object'.
-            # When data is added, pandas will infer. We handle conversion on load.
-            return df
+        else:
+            # st.warning(f"La tabla '{table_name}' no existe en la base de datos. Creando DataFrame vacío.") # Can be noisy
+            # Return empty DataFrame with expected columns and appropriate dtypes
+            df = pd.DataFrame(columns=expected_cols)
+            # No need to set dtypes aggressively on empty DF, handled by conversion on load/save
 
     except sqlite3.Error as e:
         st.error(f"Error al leer la tabla {table_name} de la base de datos: {e}")
         # Return empty DataFrame with expected columns on error
-        expected_cols_types = TABLE_COLUMNS.get(table_name, {})
-        df = pd.DataFrame(columns=expected_cols_types.keys())
-        for col, dtype in expected_cols_types.items():
-             if col in df.columns:
-                 df[col] = df[col].astype(dtype)
-        return df
+        expected_cols = list(TABLE_COLUMNS.get(table_name, {}).keys())
+        df = pd.DataFrame(columns=expected_cols)
+    except Exception as e:
+         st.error(f"Error general al cargar la tabla {table_name}: {e}")
+         expected_cols = list(TABLE_COLUMNS.get(table_name, {}).keys())
+         df = pd.DataFrame(columns=expected_cols)
     finally:
-        if conn:
-            conn.close()
+        # No need to close conn if it's cached with @st.cache_resource
+        pass
+
+    return df
+
 
 def save_table(df, db_file, table_name):
     """Guarda un DataFrame en una tabla SQLite (reemplazando la tabla si existe)."""
-    conn = None # Initialize connection to None
+    conn = get_db_conn() # Use cached connection
     try:
-        conn = get_db_conn()
+        df_to_save = df.copy() # Work on a copy to avoid modifying original session state DF directly
+
         # Convert date objects to string format 'YYYY-MM-DD' before saving
         if table_name in DATE_COLUMNS:
             for col in DATE_COLUMNS[table_name]:
-                 if col in df.columns:
-                      # Convert to datetime first to handle potential mixed types, then format as string
-                     df[col] = pd.to_datetime(df[col], errors='coerce').dt.strftime('%Y-%m-%d').fillna('') # Handle NaT by filling with empty string or other marker
+                 if col in df_to_save.columns:
+                      # Convert to datetime first (handles date/object types), then format as string
+                      # Fill NaT (invalid dates) or None dates with empty string or a marker
+                      df_to_save[col] = pd.to_datetime(df_to_save[col], errors='coerce').dt.strftime('%Y-%m-%d').fillna('') # Replace NaT with ''
 
-        # Use if_exists='replace' to overwrite the table with the current DataFrame content
-        df.to_sql(table_name, conn, if_exists='replace', index=False)
-        conn.commit() # Commit changes
-        # st.success(f"Datos guardados en la tabla {table_name}") # Too verbose, comment
+        # Ensure all expected columns are present before saving.
+        expected_cols_dict = TABLE_COLUMNS.get(table_name, {})
+        for col, dtype in expected_cols_dict.items():
+            if col not in df_to_save.columns:
+                # Add missing column with default value before saving
+                df_to_save[col] = pd.NA if dtype == 'object' else 0 # Use pd.NA for consistency with missing values
+
+        # Ensure any pd.NA/None values in object columns are saved as None (NULL in SQL)
+        # Pandas often handles this, but explicit conversion can help
+        for col, dtype in expected_cols_dict.items():
+            if dtype == 'object' and col in df_to_save.columns:
+                # Convert pandas NA or numpy nan in object columns to None
+                df_to_save[col] = df_to_save[col].where(pd.notna(df_to_save[col]), None)
+
+
+        # Use if_exists='replace' to overwrite the table
+        # This mode drops the existing table and creates a new one.
+        # It's simple but can lose database-level configurations (like indices, foreign keys)
+        # not managed by pandas. For this app's scale, it's usually fine.
+        df_to_save.to_sql(table_name, conn, if_exists='replace', index=False)
+        conn.commit() # Commit changes after successful write
 
     except sqlite3.Error as e:
         st.error(f"Error al guardar en la tabla {table_name} en la base de datos: {e}")
+        if conn:
+             try:
+                  conn.rollback() # Rollback changes if save failed
+             except Exception as rb_e:
+                  st.error(f"Error durante el rollback: {rb_e}")
     except Exception as e:
          st.error(f"Error general al guardar en la tabla {table_name}: {e}")
+         if conn:
+              try:
+                   conn.rollback() # Rollback changes if save failed
+              except Exception as rb_e:
+                   st.error(f"Error durante el rollback: {rb_e}")
+
     finally:
-        if conn:
-            conn.close()
+        # No need to close conn if it's cached with @st.cache_resource
+        pass
 
 
 # --- Cargar todos los DataFrames al inicio (si no están en session_state) ---
 # Usamos st.session_state para mantener los datos a través de las interacciones del usuario
 
+# Load Flotas first as Equipos depends on it for dropdowns
+if 'df_flotas' not in st.session_state:
+    st.session_state.df_flotas = load_table(DATABASE_FILE, TABLE_FLOTAS)
+    # Ensure ID column exists even if empty
+    if st.session_state.df_flotas.empty or 'ID_Flota' not in st.session_state.df_flotas.columns:
+         st.session_state.df_flotas = pd.DataFrame(columns=TABLE_COLUMNS[TABLE_FLOTAS].keys())
+
 if 'df_equipos' not in st.session_state:
     st.session_state.df_equipos = load_table(DATABASE_FILE, TABLE_EQUIPOS)
+    # Ensure ID_Flota column exists for older data files or initial empty state
+    if 'ID_Flota' not in st.session_state.df_equipos.columns:
+         st.session_state.df_equipos['ID_Flota'] = pd.NA # Use pd.NA for empty fleet (represents missing value)
 
+# Load other tables
 if 'df_consumo' not in st.session_state:
     st.session_state.df_consumo = load_table(DATABASE_FILE, TABLE_CONSUMO)
 
@@ -161,44 +222,32 @@ if 'df_precios_combustible' not in st.session_state:
 
 if 'df_proyectos' not in st.session_state:
     st.session_state.df_proyectos = load_table(DATABASE_FILE, TABLE_PROYECTOS)
-    # Ensure ID column exists even if empty
     if st.session_state.df_proyectos.empty or 'ID_Obra' not in st.session_state.df_proyectos.columns:
-         st.session_state.df_proyectos = pd.DataFrame(columns=TABLE_COLUMNS[TABLE_PROYECTOS].keys()) # Re-create with expected columns
+         st.session_state.df_proyectos = pd.DataFrame(columns=TABLE_COLUMNS[TABLE_PROYECTOS].keys())
 
 if 'df_presupuesto_materiales' not in st.session_state:
     st.session_state.df_presupuesto_materiales = load_table(DATABASE_FILE, TABLE_PRESUPUESTO_MATERIALES)
-    # Ensure calculated column exists
     if 'Costo_Presupuestado' not in st.session_state.df_presupuesto_materiales.columns:
          st.session_state.df_presupuesto_materiales['Costo_Presupuestado'] = 0.0
 
 if 'df_compras_materiales' not in st.session_state:
     st.session_state.df_compras_materiales = load_table(DATABASE_FILE, TABLE_COMPRAS_MATERIALES)
-    # Ensure calculated column and ID column exist/are unique if needed
     if 'Costo_Compra' not in st.session_state.df_compras_materiales.columns:
          st.session_state.df_compras_materiales['Costo_Compra'] = 0.0
-    # Simple check/re-generation of IDs if loaded data doesn't have them or they aren't unique
-    # This might be too aggressive; unique IDs should ideally be generated *on creation*
-    # Let's keep the ID generation only on form submission for new rows.
-    # Ensure the column exists though:
-    if 'ID_Compra' not in st.session_state.df_compras_materiales.columns:
-        st.session_state.df_compras_materiales['ID_Compra'] = [f"COMPRA_OLD_{i}" for i in range(len(st.session_state.df_compras_materiales))]
-
+    if 'ID_Compra' not in st.session_state.df_compras_materiales.columns: # Ensure ID column exists
+        st.session_state.df_compras_materiales['ID_Compra'] = [f"COMPRA_OLD_{i}" for i in range(len(st.session_state.df_compras_materiales))] # Placeholder IDs
 
 if 'df_asignacion_materiales' not in st.session_state:
     st.session_state.df_asignacion_materiales = load_table(DATABASE_FILE, TABLE_ASIGNACION_MATERIALES)
-    # Ensure calculated column and ID column exist
     if 'Costo_Asignado' not in st.session_state.df_asignacion_materiales.columns:
          st.session_state.df_asignacion_materiales['Costo_Asignado'] = 0.0
-    # Ensure the column exists though:
-    if 'ID_Asignacion' not in st.session_state.df_asignacion_materiales.columns:
-        st.session_state.df_asignacion_materiales['ID_Asignacion'] = [f"ASIG_OLD_{i}" for i in range(len(st.session_state.df_asignacion_materiales))]
+    if 'ID_Asignacion' not in st.session_state.df_asignacion_materiales.columns: # Ensure ID column exists
+        st.session_state.df_asignacion_materiales['ID_Asignacion'] = [f"ASIG_OLD_{i}" for i in range(len(st.session_state.df_asignacion_materiales))] # Placeholder IDs
 
 
 # --- Helper para calcular costos ---
-# Se asegura de no fallar si alguna columna falta temporalmente
 def calcular_costo_presupuestado(df):
     """Calcula el costo total presupuestado por fila."""
-    # Ensure columns are numeric, coerce errors to handle potential non-numeric input from editor
     df['Cantidad_Presupuestada'] = pd.to_numeric(df.get('Cantidad_Presupuestada', 0), errors='coerce').fillna(0)
     df['Precio_Unitario_Presupuestado'] = pd.to_numeric(df.get('Precio_Unitario_Presupuestado', 0), errors='coerce').fillna(0)
     df['Costo_Presupuestado'] = df['Cantidad_Presupuestada'] * df['Precio_Unitario_Presupuestado']
@@ -227,63 +276,169 @@ if not st.session_state.df_compras_materiales.empty:
 if not st.session_state.df_asignacion_materiales.empty:
     st.session_state.df_asignacion_materiales = calcular_costo_asignado(st.session_state.df_asignacion_materiales)
 
-
-# --- Authentication Removed ---
-# The authentication setup and login/logout calls are removed.
-# The sidebar and page content logic will now run unconditionally.
-
-
 # --- Funciones para cada "Página" ---
+
+def page_flotas():
+    st.title("Gestión de Flotas")
+    st.write("Aquí puedes añadir y ver la lista de flotas.")
+
+    st.subheader("Añadir Nueva Flota")
+    with st.form("form_add_flota", clear_on_submit=True):
+        nombre_flota = st.text_input("Nombre de la Flota").strip()
+        submitted = st.form_submit_button("Añadir Flota")
+        if submitted:
+            if nombre_flota:
+                # Generate simple unique ID (using timestamp)
+                id_flota = f"FLOTA_{int(time.time() * 1000)}_{len(st.session_state.df_flotas)}"
+                # Basic check for immediate collisions (unlikely with high precision timestamp)
+                if id_flota in st.session_state.df_flotas['ID_Flota'].values:
+                     id_flota = f"FLOTA_{int(time.time() * 1000 + 1)}_{len(st.session_state.df_flotas)}"
+
+                new_flota = pd.DataFrame([{'ID_Flota': id_flota, 'Nombre_Flota': nombre_flota}])
+                st.session_state.df_flotas = pd.concat([st.session_state.df_flotas, new_flota], ignore_index=True)
+                save_table(st.session_state.df_flotas, DATABASE_FILE, TABLE_FLOTAS) # Save to DB
+                st.success(f"Flota '{nombre_flota}' añadida con ID: {id_flota}.")
+                st.experimental_rerun() # Rerun to update the list and selectboxes on other pages
+            else:
+                st.warning("Por favor, complete el Nombre de la Flota.")
+
+    st.subheader("Lista de Flotas")
+    if st.session_state.df_flotas.empty:
+         st.info("No hay flotas registradas aún.")
+    else:
+        # Use data_editor to allow editing and deletion
+        df_flotas_editable = st.session_state.df_flotas.copy()
+        df_flotas_edited = st.data_editor(
+            df_flotas_editable,
+            key="data_editor_flotas",
+            num_rows="dynamic",
+            column_config={
+                 "ID_Flota": st.column_config.TextColumn("ID Flota", disabled=True), # Prevent editing ID
+                 "Nombre_Flota": st.column_config.TextColumn("Nombre Flota", required=True),
+            }
+        )
+
+        # Logic to save changes from data_editor
+        if not df_flotas_edited.equals(st.session_state.df_flotas):
+             st.session_state.df_flotas = df_flotas_edited
+             if st.button("Guardar Cambios en Lista de Flotas"):
+                  # Validate before saving (e.g., Nombre_Flota not empty)
+                  if st.session_state.df_flotas['Nombre_Flota'].isnull().any() or (st.session_state.df_flotas['Nombre_Flota'].astype(str) == '').any():
+                      st.error("Error: Los nombres de las flotas no pueden estar vacíos.")
+                  else:
+                      save_table(st.session_state.df_flotas, DATABASE_FILE, TABLE_FLOTAS) # Save to DB
+                      st.success("Cambios en la lista de flotas guardados.")
+                      st.experimental_rerun() # Rerun to update selectboxes on other pages
+             else:
+                 st.info("Hay cambios sin guardar en la lista de flotas.") # Feedback al usuario
+
 
 def page_equipos():
     st.title("Gestión de Equipos de Mina")
     st.write("Aquí puedes añadir y ver la lista de equipos.")
 
     st.subheader("Añadir Nuevo Equipo")
+    # Get list of available fleets for the selectbox
+    flotas_disponibles = st.session_state.df_flotas[['ID_Flota', 'Nombre_Flota']].to_dict('records')
+    # Add an option for no fleet assignment
+    flota_options = [{"ID_Flota": pd.NA, "Nombre_Flota": "Sin Flota"}] + flotas_disponibles # Use pd.NA for 'Sin Flota' value
+    flota_option_labels = [f"{f['Nombre_Flota']} (ID: {f['ID_Flota']})" if pd.notna(f['ID_Flota']) else f['Nombre_Flota'] for f in flota_options]
+
+
     with st.form("form_add_equipo", clear_on_submit=True):
         interno = st.text_input("Interno del Equipo").strip()
         patente = st.text_input("Patente").strip()
+        # Selectbox for assigning Fleet
+        selected_flota_label = st.selectbox(
+            "Seleccionar Flota:",
+            flota_option_labels,
+            index=0 # Default to "Sin Flota" (which corresponds to the first item, pd.NA)
+        )
+        # Find the corresponding ID_Flota from the selected label
+        selected_flota_id = None # Default to None (or pd.NA) if "Sin Flota" is selected
+        for f in flota_options:
+             display_label = f"{f['Nombre_Flota']} (ID: {f['ID_Flota']})" if pd.notna(f['ID_Flota']) else f['Nombre_Flota']
+             if selected_flota_label == display_label:
+                  selected_flota_id = f['ID_Flota']
+                  break
+
+
         submitted = st.form_submit_button("Añadir Equipo")
         if submitted:
             if interno and patente:
                 if interno in st.session_state.df_equipos['Interno'].values:
                     st.warning(f"Ya existe un equipo con Interno {interno}")
                 else:
-                    new_equipo = pd.DataFrame([{'Interno': interno, 'Patente': patente}])
+                    new_equipo = pd.DataFrame([{'Interno': interno, 'Patente': patente, 'ID_Flota': selected_flota_id}]) # selected_flota_id is already pd.NA if "Sin Flota"
                     st.session_state.df_equipos = pd.concat([st.session_state.df_equipos, new_equipo], ignore_index=True)
                     save_table(st.session_state.df_equipos, DATABASE_FILE, TABLE_EQUIPOS) # Save to DB
-                    st.success(f"Equipo {interno} ({patente}) añadido.")
+                    flota_name_display = next((f['Nombre_Flota'] for f in flota_options if f['ID_Flota'] is selected_flota_id), 'Sin Flota') # Get name for success message
+                    st.success(f"Equipo {interno} ({patente}) añadido a flota '{flota_name_display}'.")
             else:
                 st.warning("Por favor, complete Interno y Patente.")
 
     st.subheader("Lista de Equipos")
-    # Usar data_editor para permitir edición directa
-    df_equipos_editable = st.session_state.df_equipos.copy() # Trabajar en una copia para el editor
+    # Usar data_editor para permitir edición directa, incluyendo la Flota
+    df_equipos_editable = st.session_state.df_equipos.copy()
+
+    # Prepare options for the Fleet SelectboxColumn in data_editor
+    # The options should just be the ID_Flota values.
+    # The format_func will display the Nombre_Flota.
+    flota_ids = st.session_state.df_flotas['ID_Flota'].tolist()
+    # Add pd.NA as a valid option for "Sin Flota"
+    flota_editor_options = [pd.NA] + flota_ids # Use pd.NA for representing absence of a value
+
+    # Create a mapping from ID_Flota to Nombre_Flota for the format_func
+    flota_id_to_name = st.session_state.df_flotas.set_index('ID_Flota')['Nombre_Flota'].to_dict()
+    # Add mapping for the "Sin Flota" option (map pd.NA, '', None to "Sin Flota")
+    flota_id_to_name[pd.NA] = "Sin Flota"
+    flota_id_to_name[''] = "Sin Flota" # Handle empty strings
+    flota_id_to_name[None] = "Sin Flota" # Handle None
+
+
     df_equipos_edited = st.data_editor(
         df_equipos_editable,
         key="data_editor_equipos",
         num_rows="dynamic",
         column_config={
              "Interno": st.column_config.TextColumn("Interno", required=True),
-             "Patente": st.column_config.TextColumn("Patente", required=True)
+             "Patente": st.column_config.TextColumn("Patente", required=True),
+             "ID_Flota": st.column_config.SelectboxColumn(
+                 "Flota",
+                 options=flota_editor_options, # Provide the list of valid IDs (+ pd.NA)
+                 required=False, # Fleet assignment is optional
+                 # Use the mapping to show Fleet Name in the dropdown
+                 format_func=lambda id: flota_id_to_name.get(id, flota_id_to_name.get(pd.NA)) # Default to 'Sin Flota' if ID not found
+             )
         }
     )
 
-    # Lógica para guardar cambios del data_editor
-    # Comparar con el original para ver si hay cambios significativos (evitar guardar innecesariamente)
+    # Logic to save changes from data_editor
     if not df_equipos_edited.equals(st.session_state.df_equipos):
          st.session_state.df_equipos = df_equipos_edited
          # Auto-save on change detected (can be slow for large data), or require a button click.
          # Button click is safer for validation and user control.
          if st.button("Guardar Cambios en Lista de Equipos"):
-              # Validar antes de guardar (ej. Internos únicos, no vacíos)
+              # Validate before saving (ej. Internos únicos, no vacíos)
               if st.session_state.df_equipos['Interno'].duplicated().any():
                   st.error("Error: Hay Internos de Equipo duplicados en la lista. Por favor, corrija los duplicados antes de guardar.")
-              elif st.session_state.df_equipos['Interno'].isnull().any() or st.session_state.df_equipos['Patente'].isnull().any():
+              elif st.session_state.df_equipos['Interno'].isnull().any() or (st.session_state.df_equipos['Interno'].astype(str) == '').any() or st.session_state.df_equipos['Patente'].isnull().any() or (st.session_state.df_equipos['Patente'].astype(str) == '').any():
                   st.error("Error: Hay campos 'Interno' o 'Patente' vacíos. Por favor, complete la información faltante.")
+              # Validate if entered ID_Flota values actually exist in df_flotas (excluding NA/None/empty)
+              invalid_fleet_ids = st.session_state.df_equipos[
+                  st.session_state.df_equipos['ID_Flota'].notna() & (st.session_state.df_equipos['ID_Flota'].astype(str) != '') # Check non-empty, non-NA IDs
+              ]['ID_Flota'].unique()
+
+              non_existent_fleet_ids = [id for id in invalid_fleet_ids if id not in st.session_state.df_flotas['ID_Flota'].values]
+
+              if non_existent_fleet_ids:
+                   st.error(f"Error: Uno o más equipos tienen un 'ID Flota' que no existe: {non_existent_fleet_ids}. Por favor, corrija.")
               else:
                   save_table(st.session_state.df_equipos, DATABASE_FILE, TABLE_EQUIPOS) # Save to DB
                   st.success("Cambios en la lista de equipos guardados.")
+                  st.experimental_rerun() # Rerun to update dependent views
+
+
          else:
              st.info("Hay cambios sin guardar en la lista de equipos.") # Feedback al usuario
 
@@ -316,17 +471,17 @@ def page_consumibles():
                     'Horas_Trabajadas': horas_trabajadas,
                     'Kilometros_Recorridos': kilometros_recorridos
                  }])
-                 # Date conversion handled by save_table before saving, load_table after loading
 
                  st.session_state.df_consumo = pd.concat([st.session_state.df_consumo, new_consumo], ignore_index=True)
                  save_table(st.session_state.df_consumo, DATABASE_FILE, TABLE_CONSUMO) # Save to DB
                  st.success("Registro de consumo añadido.")
+                 st.experimental_rerun() # Rerun to update editor view
             else:
                 st.warning("Por favor, complete todos los campos y añada al menos un valor (Litros, Horas o Kilómetros).")
 
     st.subheader("Registros de Consumo Existente")
     df_consumo_editable = st.session_state.df_consumo.copy()
-    # Ensure Fecha is datetime for data_editor if it was loaded as date objects
+    # Ensure Fecha is datetime for data_editor
     if 'Fecha' in df_consumo_editable.columns:
         df_consumo_editable['Fecha'] = pd.to_datetime(df_consumo_editable['Fecha'])
 
@@ -342,19 +497,24 @@ def page_consumibles():
               "Kilometros_Recorridos": st.column_config.NumberColumn("Kilómetros Recorridos", min_value=0.0, format="%.2f", required=True),
          }
      )
-    if not df_consumo_edited.equals(df_consumo_editable): # Compare with the version before editor
+    # Compare edited with current session state dataframe for changes
+    if not df_consumo_edited.equals(st.session_state.df_consumo):
          st.session_state.df_consumo = df_consumo_edited.copy()
          # Convert date column back to date objects for internal consistency in session state
          if 'Fecha' in st.session_state.df_consumo.columns:
-             st.session_state.df_consumo['Fecha'] = pd.to_datetime(st.session_state.df_consumo['Fecha'], errors='coerce').dt.date.dropna()
+             st.session_state.df_consumo['Fecha'] = pd.to_datetime(st.session_state.df_consumo['Fecha'], errors='coerce').dt.date.where(pd.notna(pd.to_datetime(st.session_state.df_consumo['Fecha'], errors='coerce').dt.date)), None # Convert and handle NaT
+
 
          if st.button("Guardar Cambios en Registros de Consumo"):
               # Basic validation
-              if st.session_state.df_consumo['Interno'].isnull().any() or st.session_state.df_consumo['Fecha'].isnull().any():
+              if st.session_state.df_consumo['Interno'].isnull().any() or (st.session_state.df_consumo['Interno'].astype(str) == '').any() or st.session_state.df_consumo['Fecha'].isnull().any():
                    st.error("Error: Campos obligatorios (Interno, Fecha) no pueden estar vacíos.")
               else:
                    save_table(st.session_state.df_consumo, DATABASE_FILE, TABLE_CONSUMO) # Save to DB
                    st.success("Cambios en registros de consumo guardados.")
+                   st.experimental_rerun()
+
+
          else:
              st.info("Hay cambios sin guardar en registros de consumo.")
 
@@ -388,6 +548,7 @@ def page_costos_equipos():
                     st.session_state.df_costos_salarial = pd.concat([st.session_state.df_costos_salarial, new_costo], ignore_index=True)
                     save_table(st.session_state.df_costos_salarial, DATABASE_FILE, TABLE_COSTOS_SALARIAL) # Save to DB
                     st.success("Costo salarial registrado.")
+                    st.experimental_rerun() # Rerun to update editor view
                 else:
                     st.warning("Por favor, complete todos los campos.")
         st.subheader("Registros Salariales Existente")
@@ -404,16 +565,19 @@ def page_costos_equipos():
                  "Monto_Salarial": st.column_config.NumberColumn("Monto Salarial", min_value=0.0, format="%.2f", required=True),
              }
         )
-        if not df_salarial_edited.equals(df_salarial_editable):
+        # Compare edited with current session state dataframe for changes
+        if not df_salarial_edited.equals(st.session_state.df_costos_salarial):
              st.session_state.df_costos_salarial = df_salarial_edited.copy()
              if 'Fecha' in st.session_state.df_costos_salarial.columns:
-                 st.session_state.df_costos_salarial['Fecha'] = pd.to_datetime(st.session_state.df_costos_salarial['Fecha'], errors='coerce').dt.date.dropna()
+                 st.session_state.df_costos_salarial['Fecha'] = pd.to_datetime(st.session_state.df_costos_salarial['Fecha'], errors='coerce').dt.date.where(pd.notna(pd.to_datetime(st.session_state.df_costos_salarial['Fecha'], errors='coerce').dt.date)), None
+
              if st.button("Guardar Cambios en Registros Salariales"):
-                  if st.session_state.df_costos_salarial['Interno'].isnull().any() or st.session_state.df_costos_salarial['Fecha'].isnull().any() or st.session_state.df_costos_salarial['Monto_Salarial'].isnull().any():
+                  if st.session_state.df_costos_salarial['Interno'].isnull().any() or (st.session_state.df_costos_salarial['Interno'].astype(str) == '').any() or st.session_state.df_costos_salarial['Fecha'].isnull().any() or st.session_state.df_costos_salarial['Monto_Salarial'].isnull().any():
                        st.error("Error: Campos obligatorios no pueden estar vacíos.")
                   else:
                        save_table(st.session_state.df_costos_salarial, DATABASE_FILE, TABLE_COSTOS_SALARIAL) # Save to DB
                        st.success("Cambios en registros salariales guardados.")
+                       st.experimental_rerun()
              else:
                  st.info("Hay cambios sin guardar en registros salariales.")
 
@@ -439,6 +603,7 @@ def page_costos_equipos():
                     st.session_state.df_gastos_fijos = pd.concat([st.session_state.df_gastos_fijos, new_gasto], ignore_index=True)
                     save_table(st.session_state.df_gastos_fijos, DATABASE_FILE, TABLE_GASTOS_FIJOS) # Save to DB
                     st.success("Gasto fijo registrado.")
+                    st.experimental_rerun() # Rerun to update editor view
                 else:
                     st.warning("Por favor, complete los campos obligatorios (Equipo, Fecha, Tipo, Monto).")
         st.subheader("Registros de Gastos Fijos Existente")
@@ -457,16 +622,19 @@ def page_costos_equipos():
                  "Descripcion": st.column_config.TextColumn("Descripción", required=False),
              }
         )
-        if not df_fijos_edited.equals(df_fijos_editable):
+        # Compare edited with current session state dataframe for changes
+        if not df_fijos_edited.equals(st.session_state.df_gastos_fijos):
              st.session_state.df_gastos_fijos = df_fijos_edited.copy()
              if 'Fecha' in st.session_state.df_gastos_fijos.columns:
-                  st.session_state.df_gastos_fijos['Fecha'] = pd.to_datetime(st.session_state.df_gastos_fijos['Fecha'], errors='coerce').dt.date.dropna()
+                  st.session_state.df_gastos_fijos['Fecha'] = pd.to_datetime(st.session_state.df_gastos_fijos['Fecha'], errors='coerce').dt.date.where(pd.notna(pd.to_datetime(st.session_state.df_gastos_fijos['Fecha'], errors='coerce').dt.date)), None
+
              if st.button("Guardar Cambios en Registros de Gastos Fijos"):
-                  if st.session_state.df_gastos_fijos['Interno'].isnull().any() or st.session_state.df_gastos_fijos['Fecha'].isnull().any() or st.session_state.df_gastos_fijos['Tipo_Gasto_Fijo'].isnull().any() or st.session_state.df_gastos_fijos['Monto_Gasto_Fijo'].isnull().any():
+                  if st.session_state.df_gastos_fijos['Interno'].isnull().any() or (st.session_state.df_gastos_fijos['Interno'].astype(str) == '').any() or st.session_state.df_gastos_fijos['Fecha'].isnull().any() or st.session_state.df_gastos_fijos['Tipo_Gasto_Fijo'].isnull().any() or (st.session_state.df_gastos_fijos['Tipo_Gasto_Fijo'].astype(str) == '').any() or st.session_state.df_gastos_fijos['Monto_Gasto_Fijo'].isnull().any():
                        st.error("Error: Campos obligatorios no pueden estar vacíos.")
                   else:
                        save_table(st.session_state.df_gastos_fijos, DATABASE_FILE, TABLE_GASTOS_FIJOS) # Save to DB
                        st.success("Cambios en registros de gastos fijos guardados.")
+                       st.experimental_rerun()
              else:
                  st.info("Hay cambios sin guardar en registros de gastos fijos.")
 
@@ -492,6 +660,7 @@ def page_costos_equipos():
                     st.session_state.df_gastos_mantenimiento = pd.concat([st.session_state.df_gastos_mantenimiento, new_gasto], ignore_index=True)
                     save_table(st.session_state.df_gastos_mantenimiento, DATABASE_FILE, TABLE_GASTOS_MANTENIMIENTO) # Save to DB
                     st.success("Gasto de mantenimiento registrado.")
+                    st.experimental_rerun() # Rerun to update editor view
                 else:
                     st.warning("Por favor, complete los campos obligatorios (Equipo, Fecha, Tipo, Monto).")
         st.subheader("Registros de Gastos de Mantenimiento Existente")
@@ -510,16 +679,18 @@ def page_costos_equipos():
                  "Descripcion": st.column_config.TextColumn("Descripción", required=False),
              }
         )
-        if not df_mantenimiento_edited.equals(df_mantenimiento_editable):
+        # Compare edited with current session state dataframe for changes
+        if not df_mantenimiento_edited.equals(st.session_state.df_gastos_mantenimiento):
              st.session_state.df_gastos_mantenimiento = df_mantenimiento_edited.copy()
              if 'Fecha' in st.session_state.df_gastos_mantenimiento.columns:
-                  st.session_state.df_gastos_mantenimiento['Fecha'] = pd.to_datetime(st.session_state.df_gastos_mantenimiento['Fecha'], errors='coerce').dt.date.dropna()
+                  st.session_state.df_gastos_mantenimiento['Fecha'] = pd.to_datetime(st.session_state.df_gastos_mantenimiento['Fecha'], errors='coerce').dt.date.where(pd.notna(pd.to_datetime(st.session_state.df_gastos_mantenimiento['Fecha'], errors='coerce').dt.date)), None
              if st.button("Guardar Cambios en Registros de Mantenimiento"):
-                  if st.session_state.df_gastos_mantenimiento['Interno'].isnull().any() or st.session_state.df_gastos_mantenimiento['Fecha'].isnull().any() or st.session_state.df_gastos_mantenimiento['Tipo_Mantenimiento'].isnull().any() or st.session_state.df_gastos_mantenimiento['Monto_Mantenimiento'].isnull().any():
+                  if st.session_state.df_gastos_mantenimiento['Interno'].isnull().any() or (st.session_state.df_gastos_mantenimiento['Interno'].astype(str) == '').any() or st.session_state.df_gastos_mantenimiento['Fecha'].isnull().any() or st.session_state.df_gastos_mantenimiento['Tipo_Mantenimiento'].isnull().any() or (st.session_state.df_gastos_mantenimiento['Tipo_Mantenimiento'].astype(str) == '').any() or st.session_state.df_gastos_mantenimiento['Monto_Mantenimiento'].isnull().any():
                        st.error("Error: Campos obligatorios no pueden estar vacíos.")
                   else:
                        save_table(st.session_state.df_gastos_mantenimiento, DATABASE_FILE, TABLE_GASTOS_MANTENIMIENTO) # Save to DB
                        st.success("Cambios en registros de mantenimiento guardados.")
+                       st.experimental_rerun()
              else:
                  st.info("Hay cambios sin guardar en registros de mantenimiento.")
 
@@ -541,22 +712,24 @@ def page_reportes_mina():
                 df_precios_temp = st.session_state.df_precios_combustible.copy()
                 if 'Fecha' in df_precios_temp.columns:
                      # Convert both sides to string or comparable type for accurate comparison
-                     df_precios_temp['Fecha_str'] = pd.to_datetime(df_precios_temp['Fecha'], errors='coerce').dt.strftime('%Y-%m-%d')
-                     fecha_precio_str = pd.to_datetime(fecha_precio, errors='coerce').strftime('%Y-%m-%d')
+                     # Using pd.Timestamp(date).date() handles date objects and ensures consistency
+                     df_precios_temp['Fecha_date'] = pd.to_datetime(df_precios_temp['Fecha'], errors='coerce').dt.date
+                     fecha_precio_date = pd.to_datetime(fecha_precio, errors='coerce').date()
 
                      st.session_state.df_precios_combustible = df_precios_temp[
-                         df_precios_temp['Fecha_str'] != fecha_precio_str
-                     ].drop(columns=['Fecha_str']) # Drop temp column
+                         df_precios_temp['Fecha_date'] != fecha_precio_date
+                     ].drop(columns=['Fecha_date']) # Drop temp column if it exists
 
                 st.session_state.df_precios_combustible = pd.concat([st.session_state.df_precios_combustible, new_precio], ignore_index=True)
                 save_table(st.session_state.df_precios_combustible, DATABASE_FILE, TABLE_PRECIOS_COMBUSTIBLE) # Save to DB
                 st.success("Precio del combustible registrado/actualizado.")
+                st.experimental_rerun() # Rerun to update editor view
             else:
                 st.warning("Por favor, complete la fecha y el precio.")
     st.subheader("Precios del Combustible Existente")
     df_precios_editable = st.session_state.df_precios_combustible.copy()
     if 'Fecha' in df_precios_editable.columns:
-         df_precios_editable['Fecha'] = pd.to_datetime(df_precios_editable['Fecha'])
+         df_precios_editable['Fecha'] = pd.to_datetime(df_precios_editable['Fecha']) # Convert for data_editor
     df_precios_edited = st.data_editor(
         df_precios_editable,
         key="data_editor_precios",
@@ -566,22 +739,25 @@ def page_reportes_mina():
             "Precio_Litro": st.column_config.NumberColumn("Precio por Litro", min_value=0.01, format="%.2f", required=True),
         }
     )
-    if not df_precios_edited.equals(df_precios_editable):
+    # Compare edited with current session state dataframe for changes
+    if not df_precios_edited.equals(st.session_state.df_precios_combustible):
          st.session_state.df_precios_combustible = df_precios_edited.copy()
          if 'Fecha' in st.session_state.df_precios_combustible.columns:
-             st.session_state.df_precios_combustible['Fecha'] = pd.to_datetime(st.session_state.df_precios_combustible['Fecha'], errors='coerce').dt.date.dropna()
+             # Convert back to date objects for session state consistency
+             st.session_state.df_precios_combustible['Fecha'] = pd.to_datetime(st.session_state.df_precios_combustible['Fecha'], errors='coerce').dt.date.where(pd.notna(pd.to_datetime(st.session_state.df_precios_combustible['Fecha'], errors='coerce').dt.date)), None
+
 
          if st.button("Guardar Cambios en Precios de Combustible"):
-              # Opcional: Validar fechas únicas si cada fecha debe tener un solo precio
-              # Need to check duplicates based on date object or string representation
+              # Optional: Validar fechas únicas si cada fecha debe tener un solo precio
               df_temp_check = st.session_state.df_precios_combustible.copy()
-              if 'Fecha' in df_temp_check.columns:
-                   df_temp_check['Fecha_str'] = pd.to_datetime(df_temp_check['Fecha'], errors='coerce').dt.strftime('%Y-%m-%d')
-                   if df_temp_check['Fecha_str'].duplicated().any():
+              if 'Fecha' in df_temp_check.columns and not df_temp_check['Fecha'].empty:
+                   # Check duplicates based on date object representation
+                   if df_temp_check['Fecha'].dropna().duplicated().any(): # Drop NA before checking duplicates
                        st.error("Error: Hay fechas duplicadas en los precios de combustible. Por favor, corrija los duplicados antes de guardar.")
                        return # Stop saving if duplicates found
               save_table(st.session_state.df_precios_combustible, DATABASE_FILE, TABLE_PRECIOS_COMBUSTIBLE) # Save to DB
               st.success("Cambios en precios de combustible guardados.")
+              st.experimental_rerun()
          else:
              st.info("Hay cambios sin guardar en precios de combustible.")
 
@@ -589,43 +765,71 @@ def page_reportes_mina():
     st.subheader("Reporte por Rango de Fechas")
     col1, col2 = st.columns(2)
 
-    # Ensure dates in session state DFs are datetime or date objects for min/max
-    min_date_cons = pd.to_datetime(st.session_state.df_consumo['Fecha'], errors='coerce').dropna().min() if not st.session_state.df_consumo.empty and 'Fecha' in st.session_state.df_consumo.columns else pd.Timestamp.now().date()
-    min_date_sal = pd.to_datetime(st.session_state.df_costos_salarial['Fecha'], errors='coerce').dropna().min() if not st.session_state.df_costos_salarial.empty and 'Fecha' in st.session_state.df_costos_salarial.columns else pd.Timestamp.now().date()
-    min_date_fij = pd.to_datetime(st.session_state.df_gastos_fijos['Fecha'], errors='coerce').dropna().min() if not st.session_state.df_gastos_fijos.empty and 'Fecha' in st.session_state.df_gastos_fijos.columns else pd.Timestamp.now().date()
-    min_date_mant = pd.to_datetime(st.session_state.df_gastos_mantenimiento['Fecha'], errors='coerce').dropna().min() if not st.session_state.df_gastos_mantenimiento.empty and 'Fecha' in st.session_state.df_gastos_mantenimiento.columns else pd.Timestamp.now().date()
-    min_date_pre = pd.to_datetime(st.session_state.df_precios_combustible['Fecha'], errors='coerce').dropna().min() if not st.session_state.df_precios_combustible.empty and 'Fecha' in st.session_state.df_precios_combustible.columns else pd.Timestamp.now().date()
+    # Recolectar todas las fechas relevantes en una lista para min/max
+    all_valid_dates_list = []
 
-    max_date_cons = pd.to_datetime(st.session_state.df_consumo['Fecha'], errors='coerce').dropna().max() if not st.session_state.df_consumo.empty and 'Fecha' in st.session_state.df_consumo.columns else pd.Timestamp.now().date()
-    max_date_sal = pd.to_datetime(st.session_state.df_costos_salarial['Fecha'], errors='coerce').dropna().max() if not st.session_state.df_costos_salarial.empty and 'Fecha' in st.session_state.df_costos_salarial.columns else pd.Timestamp.now().date()
-    max_date_fij = pd.to_datetime(st.session_state.df_gastos_fijos['Fecha'], errors='coerce').dropna().max() if not st.session_state.df_gastos_fijos.empty and 'Fecha' in st.session_state.df_gastos_fijos.columns else pd.Timestamp.now().date()
-    max_date_mant = pd.to_datetime(st.session_state.df_gastos_mantenimiento['Fecha'], errors='coerce').dropna().max() if not st.session_state.df_gastos_mantenimiento.empty and 'Fecha' in st.session_state.df_gastos_mantenimiento.columns else pd.Timestamp.now().date()
-    max_date_pre = pd.to_datetime(st.session_state.df_precios_combustible['Fecha'], errors='coerce').dropna().max() if not st.session_state.df_precios_combustible.empty and 'Fecha' in st.session_state.df_precios_combustible.columns else pd.Timestamp.now().date()
+    # List of dataframes and their date column names to check
+    df_date_cols_pairs = [
+        (st.session_state.df_consumo, 'Fecha'),
+        (st.session_state.df_costos_salarial, 'Fecha'),
+        (st.session_state.df_gastos_fijos, 'Fecha'),
+        (st.session_state.df_gastos_mantenimiento, 'Fecha'),
+        (st.session_state.df_precios_combustible, 'Fecha')
+    ]
 
-    # Determine the overall min/max date across relevant dataframes
-    all_relevant_dates = pd.to_datetime([]).date # Start with empty Series of date objects
-    if not st.session_state.df_consumo.empty and 'Fecha' in st.session_state.df_consumo.columns:
-         all_relevant_dates = all_relevant_dates.union(pd.to_datetime(st.session_state.df_consumo['Fecha'], errors='coerce').dropna().dt.date)
-    if not st.session_state.df_costos_salarial.empty and 'Fecha' in st.session_state.df_costos_salarial.columns:
-         all_relevant_dates = all_relevant_dates.union(pd.to_datetime(st.session_state.df_costos_salarial['Fecha'], errors='coerce').dropna().dt.date)
-    if not st.session_state.df_gastos_fijos.empty and 'Fecha' in st.session_state.df_gastos_fijos.columns:
-         all_relevant_dates = all_relevant_dates.union(pd.to_datetime(st.session_state.df_gastos_fijos['Fecha'], errors='coerce').dropna().dt.date)
-    if not st.session_state.df_gastos_mantenimiento.empty and 'Fecha' in st.session_state.df_gastos_mantenimiento.columns:
-         all_relevant_dates = all_relevant_dates.union(pd.to_datetime(st.session_state.df_gastos_mantenimiento['Fecha'], errors='coerce').dropna().dt.date)
-    if not st.session_state.df_precios_combustible.empty and 'Fecha' in st.session_state.df_precios_combustible.columns:
-         all_relevant_dates = all_relevant_dates.union(pd.to_datetime(st.session_state.df_precios_combustible['Fecha'], errors='coerce').dropna().dt.date)
+    for df, date_col in df_date_cols_pairs:
+        if not df.empty and date_col in df.columns:
+            # Convert potential date/object types to datetime, drop NaT, convert to Python date objects
+            valid_dates_series = pd.to_datetime(df[date_col], errors='coerce').dropna().dt.date
+            if not valid_dates_series.empty:
+                 all_valid_dates_list.extend(valid_dates_series.tolist()) # Convert the Series to list and extend
 
-    min_app_date = min(all_relevant_dates) if not all_relevant_dates.empty else pd.Timestamp.now().date() - pd.Timedelta(days=365) # Default to a year ago
-    max_app_date = max(all_relevant_dates) if not all_relevant_dates.empty else pd.Timestamp.now().date() # Default to today
 
-    # Ensure date inputs have valid default values within possible range
-    default_start = max_app_date - pd.Timedelta(days=30) if max_app_date - pd.Timedelta(days=30) >= min_app_date else min_app_date
-    default_end = max_app_date
+    if all_valid_dates_list: # Check if the list is not empty
+        min_app_date = min(all_valid_dates_list) # Use Python's min() function on the list of dates
+        max_app_date = max(all_valid_dates_list) # Use Python's max() function on the list of dates
+        # Suggest recent months
+        default_end_p2 = max_app_date
+        default_start_p2 = default_end_p2 - pd.Timedelta(days=30)
+        default_end_p1 = default_start_p2 - pd.Timedelta(days=1)
+        default_start_p1 = default_end_p1 - pd.Timedelta(days=30)
+
+        # Ensure default dates are within the min/max range
+        min_date_input = min_app_date
+        max_date_input = max_app_date
+
+        default_start_p1 = max(default_start_p1, min_date_input)
+        default_end_p1 = max(default_end_p1, min_date_input)
+        default_start_p2 = max(default_start_p2, min_date_input)
+        default_end_p2 = max(default_end_p2, min_date_input)
+         # Ensure period end is not before period start
+        default_end_p1 = max(default_end_p1, default_start_p1)
+        default_end_p2 = max(default_end_p2, default_start_p2)
+
+    else:
+        # Fallback if no data dates exist
+        today = pd.Timestamp.now().date()
+        min_date_input = today - pd.Timedelta(days=365) # Default range
+        max_date_input = today
+        default_end_p2 = max_date_input
+        default_start_p2 = default_end_p2 - pd.Timedelta(days=30)
+        default_end_p1 = default_start_p2 - pd.Timedelta(days=1)
+        default_start_p1 = default_end_p1 - pd.Timedelta(days=30)
+
+        # Ensure default range is valid
+        default_start_p1 = max(default_start_p1, min_date_input)
+        default_end_p1 = max(default_end_p1, min_date_input)
+        default_start_p2 = max(default_start_p2, min_date_input)
+        default_end_p2 = max(default_end_p2, min_date_input)
+        default_end_p1 = max(default_end_p1, default_start_p1)
+        default_end_p2 = max(default_end_p2, default_start_p2)
+
 
     with col1:
-        fecha_inicio = st.date_input("Fecha de Inicio del Reporte", default_start, min_value=min_app_date, max_value=max_app_date)
+        fecha_inicio = st.date_input("Fecha de Inicio del Reporte", default_start_p1, min_value=min_date_input, max_value=max_date_input)
     with col2:
-        fecha_fin = st.date_input("Fecha de Fin del Reporte", default_end, min_value=min_app_date, max_value=max_app_date)
+        fecha_fin = st.date_input("Fecha de Fin del Reporte", default_end_p2, min_value=min_date_input, max_value=max_date_input)
+
 
     if st.button("Generar Reporte"):
         if fecha_inicio > fecha_fin:
@@ -633,7 +837,6 @@ def page_reportes_mina():
             return
 
         # Ensure date columns in the DFs being filtered are datetime objects for robust comparison
-        # Filter needs pd.Timestamp for comparison, not date objects directly sometimes
         df_consumo_temp = st.session_state.df_consumo.copy()
         if 'Fecha' in df_consumo_temp.columns:
              df_consumo_temp['Fecha'] = pd.to_datetime(df_consumo_temp['Fecha'], errors='coerce').dropna()
@@ -668,15 +871,14 @@ def page_reportes_mina():
 
         if df_consumo_filtrado.empty:
             st.info("No hay datos de consumo en el rango de fechas seleccionado.")
-            # We continue to show other costs if they exist
             reporte_resumen_consumo = pd.DataFrame(columns=['Interno', 'Costo_Total_Combustible']) # Empty DF for later merge
         else:
              # Calcular métricas por equipo y fecha en el periodo
              df_consumo_filtrado['Consumo_L_H'] = df_consumo_filtrado.apply(
-                 lambda row: row['Consumo_Litros'] / row['Horas_Trabajadas'] if row['Horas_Trabajadas'] > 0 else 0, axis=1
+                 lambda row: 0 if row['Horas_Trabajadas'] == 0 else row['Consumo_Litros'] / row['Horas_Trabajadas'], axis=1
              )
              df_consumo_filtrado['Consumo_L_KM'] = df_consumo_filtrado.apply(
-                  lambda row: row['Consumo_Litros'] / row['Kilometros_Recorridos'] if row['Kilometros_Recorridos'] > 0 else 0, axis=1
+                  lambda row: 0 if row['Kilometros_Recorridos'] == 0 else row['Consumo_Litros'] / row['Kilometros_Recorridos'], axis=1
              )
 
              # Unir con precios de combustible (usando el precio más reciente antes o en la fecha de consumo)
@@ -684,15 +886,29 @@ def page_reportes_mina():
              consumo_for_merge = df_consumo_filtrado.sort_values('Fecha')
              precios_for_merge = precios_filtrado.sort_values('Fecha')
 
-             # merge_asof requires 'Fecha' to be datetime, which df_..._temp are
-             reporte_consumo = pd.merge_asof(
-                 consumo_for_merge,
-                 precios_for_merge,
-                 on='Fecha',
-                 by='Interno' if 'Interno' in precios_for_merge.columns else None, # Intenta unir por Interno si es posible (precio por equipo)
-                 direction='backward'
-             )
+             # merge_asof requires 'Fecha' to be datetime
+             # Ensure 'Interno' is present in prices if merging by it
+             if 'Interno' not in precios_for_merge.columns:
+                  # If prices are not per equipment, just merge on date
+                  # Ensure unique dates in prices for merge_asof
+                  precios_for_merge_unique = precios_for_merge[['Fecha', 'Precio_Litro']].dropna(subset=['Fecha', 'Precio_Litro']).drop_duplicates(subset=['Fecha']).sort_values('Fecha')
+                  consumo_p1_merged = pd.merge_asof(consumo_for_merge, precios_for_merge_unique, on='Fecha', direction='backward')
+             else:
+                  # If prices are per equipment, merge by both date and Interno
+                  # Ensure unique (Fecha, Interno) in prices for merge_asof
+                  precios_for_merge_unique = precios_for_merge.dropna(subset=['Interno', 'Fecha', 'Precio_Litro']).drop_duplicates(subset=['Interno', 'Fecha']).sort_values(['Interno', 'Fecha'])
+                  consumo_for_merge = consumo_for_merge.sort_values(['Interno', 'Fecha']) # Also sort consumo by Interno then Fecha for merge_asof with 'by'
+                  consumo_p1_merged = pd.merge_asof(
+                      consumo_for_merge,
+                      precios_for_merge_unique,
+                      on='Fecha',
+                      by='Interno',
+                      direction='backward'
+                  )
+
+
              # Calcular costo del combustible
+             reporte_consumo = consumo_p1_merged # Rename for clarity
              reporte_consumo['Costo_Combustible'] = reporte_consumo['Consumo_Litros'] * reporte_consumo['Precio_Litro'].fillna(0) # If no price, cost is 0
 
              # Resumen de Consumo y Costo Combustible por Equipo en el período
@@ -703,20 +919,23 @@ def page_reportes_mina():
                  Costo_Total_Combustible=('Costo_Combustible', 'sum')
              ).reset_index()
 
-             # Calcular L/H y L/KM promedio en el período
+             # Recalcular L/H y L/KM promedio *después* de sumar
              reporte_resumen_consumo['Avg_Consumo_L_H'] = reporte_resumen_consumo.apply(
-                  lambda row: row['Total_Consumo_Litros'] / row['Total_Horas'] if row['Total_Horas'] > 0 else 0, axis=1
+                  lambda row: 0 if row['Total_Horas'] == 0 else row['Total_Consumo_Litros'] / row['Total_Horas'], axis=1
              )
              reporte_resumen_consumo['Avg_Consumo_L_KM'] = reporte_resumen_consumo.apply(
-                  lambda row: row['Total_Consumo_Litros'] / row['Total_Kilometros'] if row['Kilometros_Recorridos'] > 0 else 0, axis=1
+                  lambda row: 0 if row['Total_Kilometros'] == 0 else row['Total_Consumo_Litros'] / row['Total_Kilometros'], axis=1
              )
 
-             # Unir con información de equipos (Patente)
-             reporte_resumen_consumo = reporte_resumen_consumo.merge(st.session_state.df_equipos[['Interno', 'Patente']], on='Interno', how='left')
+             # Unir con información de equipos (Patente, ID_Flota) y luego con Flotas (Nombre_Flota)
+             reporte_resumen_consumo = reporte_resumen_consumo.merge(st.session_state.df_equipos[['Interno', 'Patente', 'ID_Flota']], on='Interno', how='left')
+             reporte_resumen_consumo = reporte_resumen_consumo.merge(st.session_state.df_flotas[['ID_Flota', 'Nombre_Flota']], on='ID_Flota', how='left')
+             reporte_resumen_consumo['Nombre_Flota'] = reporte_resumen_consumo['Nombre_Flota'].fillna('Sin Flota') # Fill missing fleet names
+
 
              st.subheader(f"Reporte Consumo y Costo Combustible ({fecha_inicio} a {fecha_fin})")
              st.dataframe(reporte_resumen_consumo[[
-                 'Interno', 'Patente', 'Total_Consumo_Litros', 'Total_Horas', 'Total_Kilometros',
+                 'Interno', 'Patente', 'Nombre_Flota', 'Total_Consumo_Litros', 'Total_Horas', 'Total_Kilometros',
                  'Avg_Consumo_L_H', 'Avg_Consumo_L_KM', 'Costo_Total_Combustible'
              ]].round(2))
 
@@ -730,20 +949,23 @@ def page_reportes_mina():
         # Unir todos los costos
         # Empezar con la lista única de equipos que tuvieron ALGÚN costo o consumo en el periodo
         all_internos_in_period = pd.concat([
-            df_consumo_filtrado['Interno'] if not df_consumo_filtrado.empty else pd.Series(dtype='object'),
-            salarial_filtrado['Interno'] if not salarial_filtrado.empty else pd.Series(dtype='object'),
-            fijos_filtrado['Interno'] if not fijos_filtrado.empty else pd.Series(dtype='object'),
-            mantenimiento_filtrado['Interno'] if not mantenimiento_filtrado.empty else pd.Series(dtype='object')
-        ]).unique()
+            df_consumo_filtrado['Interno'] if not df_consumo_filtrado.empty and 'Interno' in df_consumo_filtrado.columns else pd.Series(dtype='object'),
+            salarial_filtrado['Interno'] if not salarial_filtrado.empty and 'Interno' in salarial_filtrado.columns else pd.Series(dtype='object'),
+            fijos_filtrado['Interno'] if not fijos_filtrado.empty and 'Interno' in fijos_filtrado.columns else pd.Series(dtype='object'),
+            mantenimiento_filtrado['Interno'] if not mantenimiento_filtrado.empty and 'Interno' in mantenimiento_filtrado.columns else pd.Series(dtype='object')
+        ]).dropna().unique() # Dropna before unique to handle potential NaNs in Interno
         df_all_internos = pd.DataFrame(all_internos_in_period, columns=['Interno'])
 
+        # Merge with cost summaries
         reporte_costo_total = df_all_internos.merge(reporte_resumen_consumo[['Interno', 'Costo_Total_Combustible']], on='Interno', how='left').fillna(0)
         reporte_costo_total = reporte_costo_total.merge(salarial_agg, on='Interno', how='left').fillna(0)
         reporte_costo_total = reporte_costo_total.merge(fijos_agg, on='Interno', how='left').fillna(0)
         reporte_costo_total = reporte_costo_total.merge(mantenimiento_agg, on='Interno', how='left').fillna(0)
 
-        # Añadir Patente
-        reporte_costo_total = reporte_costo_total.merge(st.session_state.df_equipos[['Interno', 'Patente']], on='Interno', how='left')
+        # Añadir Patente y Flota
+        reporte_costo_total = reporte_costo_total.merge(st.session_state.df_equipos[['Interno', 'Patente', 'ID_Flota']], on='Interno', how='left')
+        reporte_costo_total = reporte_costo_total.merge(st.session_state.df_flotas[['ID_Flota', 'Nombre_Flota']], on='ID_Flota', how='left')
+        reporte_costo_total['Nombre_Flota'] = reporte_costo_total['Nombre_Flota'].fillna('Sin Flota')
 
 
         reporte_costo_total['Costo_Total_Equipo'] = reporte_costo_total['Costo_Total_Combustible'] + reporte_costo_total['Total_Salarial'] + reporte_costo_total['Total_Gastos_Fijos'] + reporte_costo_total['Total_Gastos_Mantenimiento']
@@ -753,7 +975,7 @@ def page_reportes_mina():
              st.info("No hay datos de costos (Combustible, Salarial, Fijos, Mantenimiento) en el rango de fechas seleccionado para ningún equipo.")
         else:
              st.dataframe(reporte_costo_total[[
-                 'Interno', 'Patente', 'Costo_Total_Combustible', 'Total_Salarial',
+                 'Interno', 'Patente', 'Nombre_Flota', 'Costo_Total_Combustible', 'Total_Salarial',
                  'Total_Gastos_Fijos', 'Total_Gastos_Mantenimiento', 'Costo_Total_Equipo'
              ]].round(2))
 
@@ -765,19 +987,25 @@ def page_variacion_costos_flota():
     st.subheader("Seleccione Períodos a Comparar")
     col1, col2, col3, col4 = st.columns(4)
     # Intentar establecer fechas por defecto basadas en datos si existen
-    all_cost_dates = pd.to_datetime([]).date # Empty date series
-    df_list_for_dates = [st.session_state.df_consumo, st.session_state.df_costos_salarial, st.session_state.df_gastos_fijos, st.session_state.df_gastos_mantenimiento, st.session_state.df_precios_combustible]
-    date_cols_list = [['Fecha'], ['Fecha'], ['Fecha'], ['Fecha'], ['Fecha']]
+    all_valid_dates_list = []
 
-    for df, cols in zip(df_list_for_dates, date_cols_list):
-        if not df.empty and cols and cols[0] in df.columns: # Check if df not empty and date column exists
-            valid_dates = pd.to_datetime(df[cols[0]], errors='coerce').dropna()
-            if not valid_dates.empty:
-                 all_cost_dates = all_cost_dates.union(valid_dates.dt.date)
+    df_date_cols_pairs = [
+        (st.session_state.df_consumo, 'Fecha'),
+        (st.session_state.df_costos_salarial, 'Fecha'),
+        (st.session_state.df_gastos_fijos, 'Fecha'),
+        (st.session_state.df_gastos_mantenimiento, 'Fecha'),
+        (st.session_state.df_precios_combustible, 'Fecha')
+    ]
 
-    if not all_cost_dates.empty:
-        min_app_date = min(all_cost_dates)
-        max_app_date = max(all_cost_dates)
+    for df, date_col in df_date_cols_pairs:
+        if not df.empty and date_col in df.columns:
+            valid_dates_series = pd.to_datetime(df[date_col], errors='coerce').dropna().dt.date
+            if not valid_dates_series.empty:
+                 all_valid_dates_list.extend(valid_dates_series.tolist())
+
+    if all_valid_dates_list:
+        min_app_date = min(all_valid_dates_list)
+        max_app_date = max(all_valid_dates_list)
         # Suggest recent months
         default_end_p2 = max_app_date
         default_start_p2 = default_end_p2 - pd.Timedelta(days=30)
@@ -785,39 +1013,50 @@ def page_variacion_costos_flota():
         default_start_p1 = default_end_p1 - pd.Timedelta(days=30)
 
         # Ensure default dates are within the min/max range
-        default_start_p1 = max(default_start_p1, min_app_date)
-        default_end_p1 = max(default_end_p1, min_app_date) # Ensure end is not before min
-        default_start_p2 = max(default_start_p2, min_app_date)
-        default_end_p2 = max(default_end_p2, min_app_date)
+        min_date_input = min_app_date
+        max_date_input = max_app_date
+
+        default_start_p1 = max(default_start_p1, min_date_input)
+        default_end_p1 = max(default_end_p1, min_date_input)
+        default_start_p2 = max(default_start_p2, min_date_input)
+        default_end_p2 = max(default_end_p2, min_date_input)
+         # Ensure period end is not before period start
+        default_end_p1 = max(default_end_p1, default_start_p1)
+        default_end_p2 = max(default_end_p2, default_start_p2)
 
 
     else:
-        # Fallback if no data dates exist
         today = pd.Timestamp.now().date()
-        min_app_date = today - pd.Timedelta(days=365)
-        max_app_date = today
-        default_end_p2 = max_app_date
+        min_date_input = today - pd.Timedelta(days=365)
+        max_date_input = today
+        default_end_p2 = max_date_input
         default_start_p2 = default_end_p2 - pd.Timedelta(days=30)
         default_end_p1 = default_start_p2 - pd.Timedelta(days=1)
         default_start_p1 = default_end_p1 - pd.Timedelta(days=30)
 
+        # Ensure default range is valid
+        default_start_p1 = max(default_start_p1, min_date_input)
+        default_end_p1 = max(default_end_p1, min_date_input)
+        default_start_p2 = max(default_start_p2, min_date_input)
+        default_end_p2 = max(default_end_p2, min_date_input)
+        default_end_p1 = max(default_end_p1, default_start_p1)
+        default_end_p2 = max(default_end_p2, default_start_p2)
+
 
     with col1:
-        fecha_inicio_p1 = st.date_input("Inicio Período 1", default_start_p1, min_value=min_app_date, max_value=max_app_date, key="fecha_inicio_p1")
+        fecha_inicio_p1 = st.date_input("Inicio Período 1", default_start_p1, min_value=min_date_input, max_value=max_date_input, key="fecha_inicio_p1")
     with col2:
-        fecha_fin_p1 = st.date_input("Fin Período 1", default_end_p1, min_value=min_app_date, max_value=max_app_date, key="fecha_fin_p1")
+        fecha_fin_p1 = st.date_input("Fin Período 1", default_end_p1, min_value=min_date_input, max_value=max_date_input, key="fecha_fin_p1")
     with col3:
-        fecha_inicio_p2 = st.date_input("Inicio Período 2", default_start_p2, min_value=min_app_date, max_value=max_app_date, key="fecha_inicio_p2")
+        fecha_inicio_p2 = st.date_input("Inicio Período 2", default_start_p2, min_value=min_date_input, max_value=max_date_input, key="fecha_inicio_p2")
     with col4:
-        fecha_fin_p2 = st.date_input("Fin Período 2", default_end_p2, min_value=min_app_date, max_value=max_app_date, key="fecha_fin_p2")
+        fecha_fin_p2 = st.date_input("Fin Período 2", default_end_p2, min_value=min_date_input, max_value=max_date_input, key="fecha_fin_p2")
 
 
     if st.button("Generar Gráfico de Cascada"):
-        # Basic date validation
         if fecha_inicio_p1 > fecha_fin_p1 or fecha_inicio_p2 > fecha_fin_p2:
              st.error("Las fechas dentro de cada período no son válidas.")
              return
-        # Optional: Warning for overlapping periods
         if not (fecha_fin_p1 < fecha_inicio_p2 or fecha_fin_p2 < fecha_inicio_p1):
              st.warning("Los períodos seleccionados se solapan. Para una comparación clara de la variación, es recomendable usar períodos que no se solapen.")
 
@@ -825,14 +1064,14 @@ def page_variacion_costos_flota():
         # --- Calcular Costos por Período y Categoría ---
         # Helper function to aggregate costs for a given date range
         def aggregate_costs(df, date_col, start_date, end_date):
-            # Ensure date column is datetime and handle errors for filtering
-            if date_col not in df.columns:
-                 return pd.DataFrame() # Return empty if date col doesn't exist
+            if df.empty or date_col not in df.columns:
+                 return pd.DataFrame()
 
             df_temp = df.copy()
             df_temp[date_col] = pd.to_datetime(df_temp[date_col], errors='coerce').dropna() # Remove rows with invalid dates
-            # Filter
-            df_filtered = df_temp[(df_temp[date_col] >= pd.to_datetime(start_date)) & (df_temp[date_col] <= pd.to_datetime(end_date))]
+            start_ts = pd.to_datetime(start_date)
+            end_ts = pd.to_datetime(end_date)
+            df_filtered = df_temp[(df_temp[date_col] >= start_ts) & (df_temp[date_col] <= end_ts)]
             return df_filtered
 
         # Costs for Period 1
@@ -845,11 +1084,23 @@ def page_variacion_costos_flota():
         # Calculate fuel cost for Period 1
         costo_combustible_p1 = 0
         if not consumo_p1.empty and not precios_p1.empty:
-             # Need to ensure dates are sorted datetime for merge_asof
              consumo_p1_sorted = consumo_p1.sort_values('Fecha')
              precios_p1_sorted = precios_p1.sort_values('Fecha')
-             # Merge asof - using date only is likely sufficient for fleet total
-             consumo_p1_merged = pd.merge_asof(consumo_p1_sorted, precios_p1_sorted, on='Fecha', direction='backward')
+             # Ensure unique dates in prices if merging without 'by'
+             if 'Interno' not in precios_p1_sorted.columns:
+                 precios_p1_sorted_unique = precios_p1_sorted[['Fecha', 'Precio_Litro']].dropna(subset=['Fecha', 'Precio_Litro']).drop_duplicates(subset=['Fecha']).sort_values('Fecha')
+                 consumo_p1_merged = pd.merge_asof(consumo_p1_sorted, precios_p1_sorted_unique, on='Fecha', direction='backward')
+             else: # Merge by Interno and Fecha
+                 precios_p1_sorted_unique = precios_p1_sorted.dropna(subset=['Interno', 'Fecha', 'Precio_Litro']).drop_duplicates(subset=['Interno', 'Fecha']).sort_values(['Interno', 'Fecha'])
+                 consumo_p1_sorted = consumo_p1_sorted.sort_values(['Interno', 'Fecha'])
+                 consumo_p1_merged = pd.merge_asof(
+                     consumo_p1_sorted,
+                     precios_p1_sorted_unique,
+                     on='Fecha',
+                     by='Interno',
+                     direction='backward'
+                 )
+
              costo_combustible_p1 = (consumo_p1_merged['Consumo_Litros'] * consumo_p1_merged['Precio_Litro'].fillna(0)).sum()
 
 
@@ -871,8 +1122,18 @@ def page_variacion_costos_flota():
         if not consumo_p2.empty and not precios_p2.empty:
              consumo_p2_sorted = consumo_p2.sort_values('Fecha')
              precios_p2_sorted = precios_p2.sort_values('Fecha')
-             consumo_p2_merged = pd.merge_asof(consumo_p2_sorted, precios_p2_sorted, on='Fecha', direction='backward')
+             # Ensure unique dates in prices if merging without 'by'
+             if 'Interno' not in precios_p2_sorted.columns:
+                  precios_p2_sorted_unique = precios_p2_sorted[['Fecha', 'Precio_Litro']].dropna(subset=['Fecha', 'Precio_Litro']).drop_duplicates(subset=['Fecha']).sort_values('Fecha')
+                  consumo_p2_merged = pd.merge_asof(consumo_p2_sorted, precios_p2_sorted_unique, on='Fecha', direction='backward')
+             else: # Merge by Interno and Fecha
+                  precios_p2_sorted_unique = precios_p2_sorted.dropna(subset=['Interno', 'Fecha', 'Precio_Litro']).drop_duplicates(subset=['Interno', 'Fecha']).sort_values(['Interno', 'Fecha'])
+                  consumo_p2_sorted = consumo_p2_sorted.sort_values(['Interno', 'Fecha'])
+                  consumo_p2_merged = pd.merge_asof(consumo_p2_sorted, precios_p2_sorted_unique, on='Fecha', by='Interno', direction='backward')
+
+
              costo_combustible_p2 = (consumo_p2_merged['Consumo_Litros'] * consumo_p2_merged['Precio_Litro'].fillna(0)).sum()
+
 
         costo_salarial_p2 = salarial_p2['Monto_Salarial'].sum() if not salarial_p2.empty and 'Monto_Salarial' in salarial_p2.columns else 0
         costo_fijos_p2 = fijos_p2['Monto_Gasto_Fijo'].sum() if not fijos_p2.empty and 'Monto_Gasto_Fijo' in fijos_p2.columns else 0
@@ -894,33 +1155,27 @@ def page_variacion_costos_flota():
         variacion_fijos = costo_fijos_p2 - costo_fijos_p1
         variacion_mantenimiento = costo_mantenimiento_p2 - costo_mantenimiento_p1
 
-        # Añadir variaciones (solo si hay alguna diferencia significativa)
-        # Use a slightly larger threshold for display purposes maybe? 10 or 100?
-        threshold = 0.01 # Keep small threshold for calculation accuracy
+        # Add variations for the plot if they are significant
+        variation_data = []
+        if abs(variacion_combustible) > 0.01:
+            variation_data.append({'label': 'Variación Combustible', 'value': variacion_combustible, 'text': f"${variacion_combustible:,.2f}"})
+        if abs(variacion_salarial) > 0.01:
+            variation_data.append({'label': 'Variación Salarial', 'value': variacion_salarial, 'text': f"${variacion_salarial:,.2f}"})
+        if abs(variacion_fijos) > 0.01:
+            variation_data.append({'label': 'Variación Fijos', 'value': variacion_fijos, 'text': f"${variacion_fijos:,.2f}"})
+        if abs(variacion_mantenimiento) > 0.01:
+            variation_data.append({'label': 'Variación Mantenimiento', 'value': variacion_mantenimiento, 'text': f"${variacion_mantenimiento:,.2f}"})
 
-        if abs(variacion_combustible) > threshold:
-            labels.append('Variación Combustible')
-            measures.append('relative')
-            values.append(variacion_combustible)
-            texts.append(f"${variacion_combustible:,.2f}")
+        # Sort variations for consistent plot order (e.g., largest increase first)
+        variation_data.sort(key=lambda x: x['value'], reverse=True)
 
-        if abs(variacion_salarial) > threshold:
-            labels.append('Variación Salarial')
+        # Add sorted variations to labels, measures, values, texts
+        for item in variation_data:
+            labels.append(item['label'])
             measures.append('relative')
-            values.append(variacion_salarial)
-            texts.append(f"${variacion_salarial:,.2f}")
+            values.append(item['value'])
+            texts.append(item['text'])
 
-        if abs(variacion_fijos) > threshold:
-            labels.append('Variación Fijos')
-            measures.append('relative')
-            values.append(variacion_fijos)
-            texts.append(f"${variacion_fijos:,.2f}")
-
-        if abs(variacion_mantenimiento) > threshold:
-            labels.append('Variación Mantenimiento')
-            measures.append('relative')
-            values.append(variacion_mantenimiento)
-            texts.append(f"${variacion_mantenimiento:,.2f}")
 
         # Añadir total Periodo 2
         labels.append(f'Total Costo<br>Periodo 2<br>({fecha_inicio_p2} a {fecha_fin_p2})')
@@ -930,7 +1185,8 @@ def page_variacion_costos_flota():
 
 
         # --- Crear Gráfico de Cascada ---
-        if len(labels) <= 1: # Only the starting point (Total Period 1) means no variation or Period 2 exists
+        # Check if there are any bars other than the start and end totals
+        if len(labels) <= 2 and abs(total_costo_p1 - total_costo_p2) < 0.01: # Only start and end, and they are equal or nearly equal
              st.info("No hay datos de costos o la variación entre los períodos es insignificante para mostrar el gráfico de cascada.")
         else:
              fig = go.Figure(go.Waterfall(
@@ -948,7 +1204,7 @@ def page_variacion_costos_flota():
                  title = f'Variación de Costos de Flota: {fecha_inicio_p1} a {fecha_fin_p1} vs {fecha_inicio_p2} a {fecha_fin_p2}',
                  showlegend = False,
                  yaxis_title="Monto ($)",
-                 margin=dict(l=20, r=20, t=100, b=20), # Ajustar márgenes para el título largo
+                 margin=dict(l=20, r=20, t=100, b=20), # Adjust margins for long title
                  height=500
              )
 
@@ -971,7 +1227,7 @@ def page_variacion_costos_flota():
             st.write(f"- Mantenimiento: ${costo_mantenimiento_p2:,.2f}")
             st.write(f"**Total Periodo 2: ${total_costo_p2:,.2f}**")
 
-        if abs(total_costo_p1 - total_costo_p2) > threshold:
+        if abs(total_costo_p1 - total_costo_p2) > 0.01:
             st.subheader("Variaciones Absolutas")
             st.write(f"- Combustible: ${variacion_combustible:,.2f}")
             st.write(f"- Salarial: ${variacion_salarial:,.2f}")
@@ -993,13 +1249,13 @@ def page_gestion_obras():
         submitted = st.form_submit_button("Crear Obra")
         if submitted:
             if nombre_obra and responsable:
-                # Generar ID único simple (usando timestamp + contador para evitar colisiones si se crean rápido)
-                # Use nanoseconds for higher chance of uniqueness if many created quickly
-                id_obra = f"OBRA_{int(pd.Timestamp.now().timestamp() * 1e9)}_{len(st.session_state.df_proyectos)}"
+                # Generar ID único simple (usando timestamp)
+                id_obra = f"OBRA_{int(time.time() * 1e9)}_{len(st.session_state.df_proyectos)}"
                 new_obra = pd.DataFrame([{'ID_Obra': id_obra, 'Nombre_Obra': nombre_obra, 'Responsable': responsable}])
                 st.session_state.df_proyectos = pd.concat([st.session_state.df_proyectos, new_obra], ignore_index=True)
                 save_table(st.session_state.df_proyectos, DATABASE_FILE, TABLE_PROYECTOS) # Save to DB
                 st.success(f"Obra '{nombre_obra}' creada con ID: {id_obra}")
+                st.experimental_rerun() # Rerun to update the list and selectbox
             else:
                 st.warning("Por favor, complete el Nombre de la Obra y el Responsable.")
 
@@ -1023,10 +1279,10 @@ def page_gestion_obras():
         if not df_proyectos_edited.equals(st.session_state.df_proyectos):
              st.session_state.df_proyectos = df_proyectos_edited
              if st.button("Guardar Cambios en Lista de Obras"):
-                 # Simple validation
-                 if st.session_state.df_proyectos['Nombre_Obra'].isnull().any() or st.session_state.df_proyectos['Responsable'].isnull().any():
+                  # Simple validation
+                  if st.session_state.df_proyectos['Nombre_Obra'].isnull().any() or (st.session_state.df_proyectos['Nombre_Obra'].astype(str) == '').any() or st.session_state.df_proyectos['Responsable'].isnull().any() or (st.session_state.df_proyectos['Responsable'].astype(str) == '').any():
                       st.error("Error: Los campos 'Nombre Obra' y 'Responsable' no pueden estar vacíos.")
-                 else:
+                  else:
                       save_table(st.session_state.df_proyectos, DATABASE_FILE, TABLE_PROYECTOS) # Save to DB
                       st.success("Cambios en la lista de obras guardados.")
                       st.experimental_rerun() # Recargar para actualizar selectbox y otros elementos dependientes
@@ -1043,20 +1299,29 @@ def page_gestion_obras():
         st.markdown("---")
         st.subheader("Gestionar Presupuesto por Obra")
 
-        obra_seleccionada_id = st.selectbox(
+        # Build options for the selectbox
+        obra_options_gestion = st.session_state.df_proyectos[['ID_Obra', 'Nombre_Obra']].to_dict('records')
+        obra_gestion_labels = [f"{o['Nombre_Obra']} (ID: {o['ID_Obra']})" for o in obra_options_gestion]
+
+        selected_obra_label_gestion = st.selectbox(
             "Seleccione una Obra:",
-            obras_disponibles,
-            format_func=lambda x: f"{st.session_state.df_proyectos[st.session_state.df_proyectos['ID_Obra'] == x]['Nombre_Obra'].iloc[0]} (ID: {x})" if not st.session_state.df_proyectos[st.session_state.df_proyectos['ID_Obra'] == x].empty else x,
+            obra_gestion_labels,
             key="select_obra_gestion"
         )
+
+        # Find the corresponding ID_Obra from the selected label
+        obra_seleccionada_id = None
+        for o in obra_options_gestion:
+            if selected_obra_label_gestion == f"{o['Nombre_Obra']} (ID: {o['ID_Obra']})":
+                 obra_seleccionada_id = o['ID_Obra']
+                 break
 
         if obra_seleccionada_id:
             # Ensure the selected ID still exists in the updated df_proyectos
             if obra_seleccionada_id not in st.session_state.df_proyectos['ID_Obra'].values:
                  st.warning(f"La obra seleccionada (ID: {obra_seleccionada_id}) ya no existe. Por favor, seleccione otra.")
-                 # Consider clearing the selectbox or state related to the selected work
-                 # This can happen if the selected work was just deleted via data_editor
-                 st.session_state.select_obra_gestion = None # Reset selectbox
+                 # Reset selectbox or state to avoid issues if selected item was deleted
+                 st.session_state.select_obra_gestion = obra_gestion_labels[0] if obra_gestion_labels else None # Reset to first option or None
                  st.experimental_rerun() # Rerun to clear the state
                  return # Exit function
 
@@ -1096,6 +1361,9 @@ def page_gestion_obras():
             st.write("Editar presupuesto existente:")
             # Only display columns the user should edit
             df_presupuesto_obra_display = df_presupuesto_obra[['Material', 'Cantidad_Presupuestada', 'Precio_Unitario_Presupuestado']].copy()
+            # Recalculate cost for display consistency in editor
+            df_presupuesto_obra_display = calcular_costo_presupuestado(df_presupuesto_obra_display)
+
             # data_editor returns a copy, work with that
             df_presupuesto_obra_edited = st.data_editor(
                 df_presupuesto_obra_display,
@@ -1110,24 +1378,31 @@ def page_gestion_obras():
 
             # Lógica para guardar cambios del data_editor
             # Compare the edited version (which only has editable columns) with a sliced version of the original
-            if not df_presupuesto_obra_edited.equals(df_presupuesto_obra[['Material', 'Cantidad_Presupuestada', 'Precio_Unitario_Presupuestado']]):
+            # Need to ensure the edited version includes the ID_Obra column before comparison/concatenation
+            df_presupuesto_obra_edited_with_id = df_presupuesto_obra_edited.copy()
+            df_presupuesto_obra_edited_with_id['ID_Obra'] = obra_seleccionada_id
+            # Recalculate cost based on edited values
+            df_presupuesto_obra_edited_with_id = calcular_costo_presupuestado(df_presupuesto_obra_edited_with_id)
+
+            # Compare the edited version with the original filtered version including ID_Obra and Costo
+            # This requires comparing on all columns that *should* be in the final DF for this obra
+            original_filtered_cols = ['ID_Obra', 'Material', 'Cantidad_Presupuestada', 'Precio_Unitario_Presupuestado', 'Costo_Presupuestado']
+            # Ensure original_filtered_cols exist in the original df before slicing
+            original_filtered_cols_present = [col for col in original_filtered_cols if col in df_presupuesto_obra.columns]
+
+
+            if not df_presupuesto_obra_edited_with_id.equals(df_presupuesto_obra[original_filtered_cols_present]):
                  if st.button(f"Guardar Cambios en Presupuesto de {obra_nombre}"):
                      # Remove the old rows for this work from the main DataFrame
                      df_rest_presupuesto = st.session_state.df_presupuesto_materiales[
                          st.session_state.df_presupuesto_materiales['ID_Obra'] != obra_seleccionada_id
                      ].copy()
 
-                     # Add the edited rows (which might include new dynamic rows from data_editor)
-                     # Ensure the ID_Obra column is present for these rows
-                     df_presupuesto_obra_edited['ID_Obra'] = obra_seleccionada_id
-                     # Recalculate cost based on edited values
-                     df_presupuesto_obra_edited = calcular_costo_presupuestado(df_presupuesto_obra_edited)
-
                      # Combine the rest of the data with the updated/edited data for this work
-                     st.session_state.df_presupuesto_materiales = pd.concat([df_rest_presupuesto, df_presupuesto_obra_edited], ignore_index=True)
+                     st.session_state.df_presupuesto_materiales = pd.concat([df_rest_presupuesto, df_presupuesto_obra_edited_with_id], ignore_index=True)
 
                      # Basic validation before saving
-                     if st.session_state.df_presupuesto_materiales[st.session_state.df_presupuesto_materiales['ID_Obra'] == obra_seleccionada_id]['Material'].isnull().any():
+                     if st.session_state.df_presupuesto_materiales[st.session_state.df_presupuesto_materiales['ID_Obra'] == obra_seleccionada_id]['Material'].isnull().any() or (st.session_state.df_presupuesto_materiales[st.session_state.df_presupuesto_materiales['ID_Obra'] == obra_seleccionada_id]['Material'].astype(str) == '').any():
                           st.error("Error: El nombre del material no puede estar vacío en el presupuesto.")
                      else:
                           save_table(st.session_state.df_presupuesto_materiales, DATABASE_FILE, TABLE_PRESUPUESTO_MATERIALES) # Save to DB
@@ -1165,15 +1440,14 @@ def page_gestion_obras():
             else:
                # Agrupar presupuesto por material
                # Use the dataframe that includes the calculated cost
-               presupuesto_agg = df_presupuesto_obra_with_cost.groupby('Material').agg(
+               presupuesto_agg = calcular_costo_presupuestado(df_presupuesto_obra.copy()).groupby('Material').agg(
                    Cantidad_Presupuestada=('Cantidad_Presupuestada', 'sum'),
                    Costo_Presupuestado=('Costo_Presupuestado', 'sum')
                ).reset_index()
 
                # Agrupar asignaciones por material
                # Ensure calculated cost is present in the assignment df
-               df_asignacion_obra_with_cost = calcular_costo_asignado(df_asignacion_obra.copy())
-               asignacion_agg = df_asignacion_obra_with_cost.groupby('Material').agg(
+               asignacion_agg = calcular_costo_asignado(df_asignacion_obra.copy()).groupby('Material').agg(
                    Cantidad_Asignada=('Cantidad_Asignada', 'sum'),
                    Costo_Asignado=('Costo_Asignado', 'sum')
                ).reset_index()
@@ -1250,6 +1524,8 @@ def page_reporte_presupuesto_total_obras():
 
     # Unir con nombres de obras
     reporte_por_obra = reporte_por_obra.merge(st.session_state.df_proyectos[['ID_Obra', 'Nombre_Obra']], on='ID_Obra', how='left')
+    reporte_por_obra['Nombre_Obra'] = reporte_por_obra['Nombre_Obra'].fillna('Obra Desconocida') # Handle cases where obra ID exists in presupuesto but not in proyectos
+
 
     st.subheader("Presupuesto Total por Obra")
     if reporte_por_obra.empty:
@@ -1280,7 +1556,7 @@ def page_compras_asignacion():
         if submitted:
             if fecha_compra and material_compra and cantidad_comprada >= 0 and precio_unitario_comprado >= 0:
                  # Generar ID único simple
-                id_compra = f"COMPRA_{int(pd.Timestamp.now().timestamp() * 1000)}_{len(st.session_state.df_compras_materiales)}"
+                id_compra = f"COMPRA_{int(time.time() * 1000)}_{len(st.session_state.df_compras_materiales)}"
                 new_compra = pd.DataFrame([{
                     'ID_Compra': id_compra,
                     'Fecha_Compra': fecha_compra, # Handled by save_table
@@ -1324,45 +1600,53 @@ def page_compras_asignacion():
          )
          # Lógica de guardado para el editor
          # Compare the edited version (which only has displayed columns) with a sliced version of the original
-         if not df_compras_edited.equals(st.session_state.df_compras_materiales[['ID_Compra', 'Fecha_Compra', 'Material', 'Cantidad_Comprada', 'Precio_Unitario_Comprado', 'Costo_Compra']]):
-             # Update the session state DataFrame with the edited data
-             # Need to handle potential new rows from 'dynamic' editor (they won't have ID_Compra initially)
-             # And deleted rows
-             # The simplest approach with 'replace' saving is to just make the edited df the new session state df
-             # Need to re-calculate cost and ensure IDs for new rows if any
-             edited_with_all_cols = df_compras_edited.copy()
+         # Need to ensure the edited version includes all original columns (like ID_Compra if not shown)
+         # The `data_editor` returns only the columns displayed.
+         # We need to merge the edited columns back into the original structure.
+         # A simpler approach when using 'replace' saving is to just make the edited df the new session state df,
+         # but we must handle columns that might have been dropped by the editor if they weren't configured/shown.
+         # The `save_table` function now adds missing expected columns before saving.
+         # So, we can just use the edited dataframe, ensure IDs for new rows, and recalculate cost.
 
-             # Re-calculate cost for edited/new rows
-             edited_with_all_cols = calcular_costo_compra(edited_with_all_cols)
-
-             # Handle new rows added via the editor (they won't have an ID_Compra)
-             # Check for rows where ID_Compra is null or empty after editing
-             if edited_with_all_cols['ID_Compra'].isnull().any() or (edited_with_all_cols['ID_Compra'].astype(str) == '').any():
-                  st.warning("Detectadas nuevas filas en el historial de compras sin ID. Se generarán IDs al guardar.")
-                  # Generate IDs only for rows that don't have one
-                  new_row_mask = edited_with_all_cols['ID_Compra'].isnull() | (edited_with_all_cols['ID_Compra'].astype(str) == '')
-                  # Simple ID generation - improve this if truly unique IDs across sessions/runs are critical
-                  # For simplicity with replace, just ensuring it's not empty is sufficient
-                  edited_with_all_cols.loc[new_row_mask, 'ID_Compra'] = [
-                       f"COMPRA_EDIT_{int(pd.Timestamp.now().timestamp() * 1000)}_{i}"
-                       for i in range(new_row_mask.sum())
-                  ]
+         # Ensure the edited dataframe is a copy to avoid SettingWithCopyWarning
+         edited_with_all_cols = df_compras_edited.copy()
 
 
-             st.session_state.df_compras_materiales = edited_with_all_cols
+         # Handle new rows added via the editor (they won't have an ID_Compra initially unless manually entered)
+         # Check for rows where ID_Compra is null or empty after editing
+         if edited_with_all_cols['ID_Compra'].isnull().any() or (edited_with_all_cols['ID_Compra'].astype(str) == '').any():
+              # st.warning("Detectadas nuevas filas en el historial de compras sin ID. Se generarán IDs al guardar.") # Can be noisy
+              # Generate IDs only for rows that don't have one or have empty strings
+              new_row_mask = edited_with_all_cols['ID_Compra'].isnull() | (edited_with_all_cols['ID_Compra'].astype(str) == '')
+              # Simple ID generation - improve this if truly unique IDs across sessions/runs are critical
+              # For simplicity with replace, just ensuring it's not empty is sufficient
+              edited_with_all_cols.loc[new_row_mask, 'ID_Compra'] = [
+                   f"COMPRA_EDIT_{int(time.time() * 1000 + i)}" # Add incrementing value for uniqueness within this batch
+                   for i in range(new_row_mask.sum())
+              ]
 
-             if st.button("Guardar Cambios en Historial de Compras"):
-                 # Validar antes de guardar (ej. campos requeridos, IDs únicos si necessary, though 'replace' handles duplicates by overwriting)
-                 if st.session_state.df_compras_materiales['Material'].isnull().any() or st.session_state.df_compras_materiales['Cantidad_Comprada'].isnull().any() or st.session_state.df_compras_materiales['Precio_Unitario_Comprado'].isnull().any():
+         # Recalculate cost for edited/new rows based on the edited values
+         edited_with_all_cols = calcular_costo_compra(edited_with_all_cols)
+
+
+         # Compare this reconstructed dataframe with the original to decide if save button is needed
+         # This comparison is tricky if data_editor reorders columns or slightly changes types.
+         # A simpler heuristic: If the number of rows is different, or if the 'edited' df (with added IDs) is simply not identical to the original.
+         # Ensure comparison only happens on columns present in both
+         common_cols = list(set(edited_with_all_cols.columns) & set(st.session_state.df_compras_materiales.columns))
+         if len(edited_with_all_cols) != len(st.session_state.df_compras_materiales) or not edited_with_all_cols[common_cols].equals(st.session_state.df_compras_materiales[common_cols]):
+
+              st.session_state.df_compras_materiales = edited_with_all_cols # Update session state with the potentially edited data
+
+              if st.button("Guardar Cambios en Historial de Compras"):
+                 # Validar antes de guardar (ej. campos requeridos)
+                 if st.session_state.df_compras_materiales['Material'].isnull().any() or (st.session_state.df_compras_materiales['Material'].astype(str) == '').any() or st.session_state.df_compras_materiales['Cantidad_Comprada'].isnull().any() or st.session_state.df_compras_materiales['Precio_Unitario_Comprado'].isnull().any():
                       st.error("Error: Hay campos obligatorios vacíos en el historial de compras.")
-                 # Optional: Check for duplicate IDs if you ever plan to merge based on ID after replacement
-                 # elif st.session_state.df_compras_materiales['ID_Compra'].duplicated().any():
-                 #     st.error("Error: Hay IDs de compra duplicados. Por favor, corrija.")
                  else:
                       save_table(st.session_state.df_compras_materiales, DATABASE_FILE, TABLE_COMPRAS_MATERIALES) # Save to DB
                       st.success("Cambios en historial de compras guardados.")
                       st.experimental_rerun() # Opcional: recargar para mostrar el DF actualizado
-             else:
+              else:
                  st.info("Hay cambios sin guardar en el historial de compras.")
 
 
@@ -1372,29 +1656,50 @@ def page_compras_asignacion():
     if st.session_state.df_proyectos.empty:
         st.warning("No hay obras creadas. No se pueden asignar materiales.")
     else:
-        obras_disponibles = st.session_state.df_proyectos['ID_Obra'].tolist()
-        # Listar materiales únicos de las compras para el selectbox, o permitir texto libre
+        # Get list of available obras for the selectbox
+        obras_disponibles_assign = st.session_state.df_proyectos['ID_Obra'].tolist()
+        obra_options_assign = st.session_state.df_proyectos[['ID_Obra', 'Nombre_Obra']].to_dict('records')
+        obra_assign_labels = [f"{o['Nombre_Obra']} (ID: {o['ID_Obra']})" for o in obra_options_assign]
+
+        # List materials from purchases for convenience (optional, still allow free text)
         materiales_comprados_unicos = st.session_state.df_compras_materiales['Material'].unique().tolist()
+        # Filter out potential None/NaN/empty string materials
+        materiales_comprados_unicos = [m for m in materiales_comprados_unicos if pd.notna(m) and str(m).strip() != '']
 
 
         with st.form("form_asignar_material", clear_on_submit=True):
             fecha_asignacion = st.date_input("Fecha de Asignación")
-            obra_destino_id = st.selectbox(
-                "Seleccione Obra de Destino:",
-                obras_disponibles,
-                 format_func=lambda x: f"{st.session_state.df_proyectos[st.session_state.df_proyectos['ID_Obra'] == x]['Nombre_Obra'].iloc[0]} (ID: {x})" if not st.session_state.df_proyectos[st.session_state.df_proyectos['ID_Obra'] == x].empty else x,
-                 key="asig_obra"
-            )
-            # Option 2: Texto libre (permite asignar stock inicial or not tied to specific purchase)
-            # If you want to use selectbox from purchased:
-            # material_assign_options = materiales_comprados_unicos + ["(Otro / No Comprado)"] # Add option for free text? Or just allow free text.
-            # material_asignado_select = st.selectbox("Material a Asignar:", material_assign_options, key="asig_material_select")
-            # if material_asignado_select == "(Otro / No Comprado)":
-            #      material_asignado = st.text_input("Especificar Material").strip()
-            # else:
-            #      material_asignado = material_asignado_select
-            # Simplest: Just allow free text input for material name
-            material_asignado = st.text_input("Nombre del Material a Asignar").strip()
+            if not obra_assign_labels: # Handle case where there are no projects but user navigated here
+                 st.warning("No hay obras disponibles para asignar materiales.")
+                 obra_destino_id = None
+                 selected_obra_label_assign = "(No hay obras)"
+            else:
+                selected_obra_label_assign = st.selectbox(
+                    "Seleccione Obra de Destino:",
+                    obra_assign_labels,
+                     key="asig_obra"
+                )
+                # Find the corresponding ID_Obra from the selected label
+                obra_destino_id = None
+                for o in obra_options_assign:
+                    if selected_obra_label_assign == f"{o['Nombre_Obra']} (ID: {o['ID_Obra']})":
+                         obra_destino_id = o['ID_Obra']
+                         break
+
+
+            # Allow selecting from purchased materials or typing manually
+            material_input_method = st.radio("¿Cómo seleccionar material?", ["Seleccionar de compras", "Escribir manualmente"], key="material_input_method")
+
+            material_asignado = None
+            if material_input_method == "Seleccionar de compras":
+                 if materiales_comprados_unicos:
+                      material_asignado = st.selectbox("Material a Asignar:", materiales_comprados_unicos, key="asig_material_select")
+                 else:
+                      st.info("No hay materiales registrados en compras.")
+                      # Fallback to manual input if no purchased materials available
+                      material_asignado = st.text_input("Nombre del Material a Asignar (Escribir manualmente)").strip()
+            else: # Escribir manualmente
+                 material_asignado = st.text_input("Nombre del Material a Asignar").strip()
 
 
             cantidad_asignada = st.number_input("Cantidad a Asignar", min_value=0.0, format="%.2f", key="asig_cantidad")
@@ -1404,28 +1709,31 @@ def page_compras_asignacion():
             submitted = st.form_submit_button("Asignar Material")
             if submitted:
                 # Check for required fields and valid numeric inputs
-                if fecha_asignacion and obra_destino_id and material_asignado and cantidad_asignada >= 0 and precio_unitario_asignado >= 0:
+                if obra_destino_id is None:
+                     st.warning("Por favor, seleccione una obra válida.")
+                elif not (fecha_asignacion and material_asignado and cantidad_asignada >= 0 and precio_unitario_asignado >= 0):
+                    st.warning("Por favor, complete todos los campos de asignación con valores válidos (Cantidad y Precio >= 0).")
+                else: # All required fields are filled and obra_destino_id is valid
                      if cantidad_asignada == 0 and precio_unitario_asignado == 0:
                           st.warning("La cantidad y el precio unitario asignado no pueden ser ambos cero si desea registrar una asignación significativa.")
-                     elif obra_destino_id not in st.session_state.df_proyectos['ID_Obra'].values:
-                          st.error(f"El ID de Obra '{obra_destino_id}' seleccionado no es válido. Por favor, seleccione una obra de la lista existente.")
-                     else:
-                          id_asignacion = f"ASIG_{int(pd.Timestamp.now().timestamp() * 1000)}_{len(st.session_state.df_asignacion_materiales)}" # Simple ID único
-                          new_asignacion = pd.DataFrame([{
-                              'ID_Asignacion': id_asignacion,
-                              'Fecha_Asignacion': fecha_asignacion, # Handled by save_table
-                              'ID_Obra': obra_destino_id,
-                              'Material': material_asignado,
-                              'Cantidad_Asignada': cantidad_asignada,
-                              'Precio_Unitario_Asignado': precio_unitario_asignado
-                          }])
-                          new_asignacion = calcular_costo_asignado(new_asignacion)
-                          st.session_state.df_asignacion_materiales = pd.concat([st.session_state.df_asignacion_materiales, new_asignacion], ignore_index=True)
-                          save_table(st.session_state.df_asignacion_materiales, DATABASE_FILE, TABLE_ASIGNACION_MATERIALES) # Save to DB
-                          st.success(f"Material '{material_asignado}' ({cantidad_asignada} unidades) asignado a obra '{st.session_state.df_proyectos[st.session_state.df_proyectos['ID_Obra'] == obra_destino_id]['Nombre_Obra'].iloc[0]}'.")
-                          st.experimental_rerun() # Rerun to update history and deshacer list
-                else:
-                    st.warning("Por favor, complete todos los campos de asignación con valores válidos (Cantidad y Precio >= 0).")
+                     # Obra ID check is implicitly handled by the selectbox if obra_destino_id is not None
+
+                     id_asignacion = f"ASIG_{int(time.time() * 1000)}_{len(st.session_state.df_asignacion_materiales)}" # Simple ID único
+                     new_asignacion = pd.DataFrame([{
+                         'ID_Asignacion': id_asignacion,
+                         'Fecha_Asignacion': fecha_asignacion, # Handled by save_table
+                         'ID_Obra': obra_destino_id,
+                         'Material': material_asignado,
+                         'Cantidad_Asignada': cantidad_asignada,
+                         'Precio_Unitario_Asignado': precio_unitario_asignado
+                     }])
+                     new_asignacion = calcular_costo_asignado(new_asignacion)
+                     st.session_state.df_asignacion_materiales = pd.concat([st.session_state.df_asignacion_materiales, new_asignacion], ignore_index=True)
+                     save_table(st.session_state.df_asignacion_materiales, DATABASE_FILE, TABLE_ASIGNACION_MATERIALES) # Save to DB
+                     obra_name_for_success = st.session_state.df_proyectos[st.session_state.df_proyectos['ID_Obra'] == obra_destino_id]['Nombre_Obra'].iloc[0]
+                     st.success(f"Material '{material_asignado}' ({cantidad_asignada} unidades) asignado a obra '{obra_name_for_success}'.")
+                     st.experimental_rerun() # Rerun to update history and deshacer list
+
 
         st.subheader("Historial de Asignaciones")
         if st.session_state.df_asignacion_materiales.empty:
@@ -1439,6 +1747,13 @@ def page_compras_asignacion():
              # Ensure cost is up-to-date in editor display
              df_asignaciones_editable = calcular_costo_asignado(df_asignaciones_editable)
 
+             # Options for ID_Obra in data_editor (should match existing obra IDs)
+             obra_ids_for_editor = st.session_state.df_proyectos['ID_Obra'].tolist()
+             # Handle case where there are no projects
+             if not obra_ids_for_editor:
+                 st.warning("No hay obras disponibles para editar asignaciones.")
+                 st.dataframe(df_asignaciones_editable) # Just show the data read from DB
+                 return # Exit function to prevent editor with invalid options
 
              df_asignaciones_edited = st.data_editor(
                  df_asignaciones_editable[['ID_Asignacion', 'Fecha_Asignacion', 'ID_Obra', 'Material', 'Cantidad_Asignada', 'Precio_Unitario_Asignado', 'Costo_Asignado']],
@@ -1447,56 +1762,45 @@ def page_compras_asignacion():
                   column_config={
                       "ID_Asignacion": st.column_config.TextColumn("ID Asignación", disabled=True),
                       "Fecha_Asignacion": st.column_config.DateColumn("Fecha Asignación", required=True),
-                      "ID_Obra": st.column_config.TextColumn("ID Obra", required=True),
+                      "ID_Obra": st.column_config.SelectboxColumn("ID Obra", options=obra_ids_for_editor, required=True), # Use Selectbox for existing work IDs
                       "Material": st.column_config.TextColumn("Material", required=True),
                       "Cantidad_Asignada": st.column_config.NumberColumn("Cantidad Asignada", min_value=0.0, format="%.2f", required=True),
                       "Precio_Unitario_Asignado": st.column_config.NumberColumn("Precio Unitario Asignado", min_value=0.0, format="%.2f", required=True),
-                      "Costo_Asignado": st.column_config.NumberColumn("Costo Asignado", disabled=True, format="%.2f") # Calculado
+                      "Costo_Asignado": st.column_config.NumberColumn("Costo Asignado", disabled=True, format="%.2f") # Calculated
                   }
              )
              # Lógica de guardado para el editor
-             # Compare the edited version with a sliced version of the original
-             if not df_asignaciones_edited.equals(st.session_state.df_asignacion_materiales[['ID_Asignacion', 'Fecha_Asignacion', 'ID_Obra', 'Material', 'Cantidad_Asignada', 'Precio_Unitario_Asignado', 'Costo_Asignado']]):
-                  edited_with_all_cols = df_asignaciones_edited.copy()
+             # Compare edited with current session state dataframe
+             edited_with_all_cols = df_asignaciones_edited.copy()
 
-                  # Re-calculate cost for edited/new rows
-                  edited_with_all_cols = calcular_costo_asignado(edited_with_all_cols)
+             # Handle new rows added via the editor (they won't have an ID_Asignacion initially)
+             if edited_with_all_cols['ID_Asignacion'].isnull().any() or (edited_with_all_cols['ID_Asignacion'].astype(str) == '').any():
+                  # st.warning("Detectadas nuevas filas en el historial de asignaciones sin ID. Se generarán IDs al guardar.") # Can be noisy
+                  new_row_mask = edited_with_all_cols['ID_Asignacion'].isnull() | (edited_with_all_cols['ID_Asignacion'].astype(str) == '')
+                  edited_with_all_cols.loc[new_row_mask, 'ID_Asignacion'] = [
+                       f"ASIG_EDIT_{int(time.time() * 1000 + i)}" # Add incrementing value
+                       for i in range(new_row_mask.sum())
+                  ]
 
-                  # Handle new rows added via the editor (they won't have an ID_Asignacion)
-                  if edited_with_all_cols['ID_Asignacion'].isnull().any() or (edited_with_all_cols['ID_Asignacion'].astype(str) == '').any():
-                       st.warning("Detectadas nuevas filas en el historial de asignaciones sin ID. Se generarán IDs al guardar.")
-                       new_row_mask = edited_with_all_cols['ID_Asignacion'].isnull() | (edited_with_all_cols['ID_Asignacion'].astype(str) == '')
-                       edited_with_all_cols.loc[new_row_mask, 'ID_Asignacion'] = [
-                            f"ASIG_EDIT_{int(pd.Timestamp.now().timestamp() * 1000)}_{i}"
-                            for i in range(new_row_mask.sum())
-                       ]
+             # Recalculate cost for edited/new rows based on the edited values
+             edited_with_all_cols = calcular_costo_asignado(edited_with_all_cols)
+
+             # Ensure comparison only happens on columns present in both
+             common_cols = list(set(edited_with_all_cols.columns) & set(st.session_state.df_asignacion_materiales.columns))
+             if len(edited_with_all_cols) != len(st.session_state.df_asignacion_materiales) or not edited_with_all_cols[common_cols].equals(st.session_state.df_asignacion_materiales[common_cols]):
 
                   st.session_state.df_asignacion_materiales = edited_with_all_cols
 
                   if st.button("Guardar Cambios en Historial de Asignaciones"):
                       # Validar antes de guardar (ej. campos requeridos, ID_Obra exista)
-                      if st.session_state.df_asignacion_materiales['ID_Obra'].isnull().any() or st.session_state.df_asignacion_materiales['Material'].isnull().any() or st.session_state.df_asignacion_materiales['Cantidad_Asignada'].isnull().any() or st.session_state.df_asignacion_materiales['Precio_Unitario_Asignado'].isnull().any():
+                      if st.session_state.df_asignacion_materiales['ID_Obra'].isnull().any() or (st.session_state.df_asignacion_materiales['ID_Obra'].astype(str) == '').any() or st.session_state.df_asignacion_materiales['Material'].isnull().any() or (st.session_state.df_asignacion_materiales['Material'].astype(str) == '').any() or st.session_state.df_asignacion_materiales['Cantidad_Asignada'].isnull().any() or st.session_state.df_asignacion_materiales['Precio_Unitario_Asignado'].isnull().any():
                            st.error("Error: Hay campos obligatorios vacíos en el historial de asignaciones.")
-                      elif not st.session_state.df_asignacion_materiales['ID_Obra'].isin(st.session_state.df_proyectos['ID_Obra']).all():
-                           # Check only IDs that are *not* empty strings or null
-                           invalid_ids = st.session_state.df_asignacion_materiales[
-                               st.session_state.df_asignacion_materiales['ID_Obra'].notna() & (st.session_state.df_asignacion_materiales['ID_Obra'].astype(str) != '')
-                           ]['ID_Obra'].unique()
-
-                           non_existent_ids = [id for id in invalid_ids if id not in st.session_state.df_proyectos['ID_Obra'].values]
-
-                           if non_existent_ids:
-                                st.error(f"Error: Una o más asignaciones tienen un 'ID Obra' que no existe en la lista de obras: {non_existent_ids}. Por favor, corrija.")
-                                # Do not save if there are invalid work IDs
-                                return
-                           else:
-                                # All non-empty work IDs exist
-                                pass # Proceed to save
-
-
-                      save_table(st.session_state.df_asignacion_materiales, DATABASE_FILE, TABLE_ASIGNACION_MATERIALES) # Save to DB
-                      st.success("Cambios en historial de asignaciones guardados.")
-                      st.experimental_rerun()
+                      # elif not st.session_state.df_asignacion_materiales['ID_Obra'].isin(st.session_state.df_proyectos['ID_Obra']).all(): # This check is redundant if ID_Obra is a SelectboxColumn
+                      #      st.error("Error: Una o más asignaciones tienen un 'ID Obra' que no existe en la lista de obras. Por favor, corrija.")
+                      else:
+                           save_table(st.session_state.df_asignacion_materiales, DATABASE_FILE, TABLE_ASIGNACION_MATERIALES) # Save to DB
+                           st.success("Cambios en historial de asignaciones guardados.")
+                           st.experimental_rerun()
                   else:
                       st.info("Hay cambios sin guardar en el historial de asignaciones.")
 
@@ -1507,19 +1811,25 @@ def page_compras_asignacion():
             st.info("No hay asignaciones para deshacer.")
         else:
             # Fetch brief info for the selectbox display
-            # Need to handle date objects for formatting
             df_asig_info = st.session_state.df_asignacion_materiales[['ID_Asignacion', 'Fecha_Asignacion', 'ID_Obra', 'Material', 'Cantidad_Asignada']].copy()
             if 'Fecha_Asignacion' in df_asig_info.columns:
                 df_asig_info['Fecha_Asignacion'] = pd.to_datetime(df_asig_info['Fecha_Asignacion'], errors='coerce').dt.strftime('%Y-%m-%d').fillna('Fecha Inválida')
 
             asig_options_dict = df_asig_info.set_index('ID_Asignacion').to_dict('index')
 
-            format_func = lambda asig_id: f"{asig_id} ({asig_options_dict.get(asig_id, {}).get('Fecha_Asignacion', 'N/A')} - {asig_options_dict.get(asig_id, {}).get('ID_Obra', 'N/A')} - {asig_options_dict.get(asig_id, {}).get('Material', 'N/A')} - {asig_options_dict.get(asig_id, {}).get('Cantidad_Asignada', 0.0):.2f})" if asig_id in asig_options_dict else asig_id
+            # Create format func that safely accesses dict elements
+            def format_assignment_option(asig_id):
+                info = asig_options_dict.get(asig_id, {})
+                fecha_str = info.get('Fecha_Asignacion', 'N/A')
+                obra_id = info.get('ID_Obra', 'N/A')
+                material = info.get('Material', 'N/A')
+                cantidad = info.get('Cantidad_Asignada', 0.0)
+                return f"{asig_id} ({fecha_str} - {obra_id} - {material} - {cantidad:.2f})"
 
             id_asignacion_deshacer = st.selectbox(
                 "Seleccione ID de Asignación a deshacer:",
                 asignaciones_disponibles,
-                format_func=format_func
+                format_func=format_assignment_option # Use the safer format function
             )
 
             if st.button(f"Deshacer Asignación Seleccionada ({id_asignacion_deshacer})"):
@@ -1578,8 +1888,10 @@ def page_reporte_variacion_total_obras():
 
     # Unir con nombres de obras (para mostrar nombres en el reporte)
     reporte_variacion_obras = reporte_variacion_obras.merge(st.session_state.df_proyectos[['ID_Obra', 'Nombre_Obra']], on='ID_Obra', how='left')
+    reporte_variacion_obras['Nombre_Obra'] = reporte_variacion_obras['Nombre_Obra'].fillna('Obra Desconocida')
 
-    # Calculate variation
+
+    # Calcular variación
     reporte_variacion_obras['Variacion_Total_Costo'] = reporte_variacion_obras['Costo_Asignado_Total'] - reporte_variacion_obras['Costo_Presupuestado_Total']
     reporte_variacion_obras['Variacion_Total_Cantidad'] = reporte_variacion_obras['Cantidad_Asignada_Total'] - reporte_variacion_obras['Cantidad_Presupuestada_Total']
 
@@ -1616,9 +1928,9 @@ def page_reporte_variacion_total_obras():
             for index, row in reporte_variacion_obras_sorted_costo.iterrows():
                  # Use shorter label for graph if needed
                  obra_label = row['Nombre_Obra']
-                 if len(obra_label) > 15: # Arbitrary length limit
-                      obra_label = obra_label[:12] + '...'
-                 labels_costo.append(f"Var: {obra_label}") # Use Nombre_Obra in label?
+                 if len(obra_label) > 25: # Arbitrary length limit for display
+                      obra_label = obra_label[:22] + '...'
+                 labels_costo.append(f"Var: {obra_label}")
 
                  values_costo.append(row['Variacion_Total_Costo'])
                  measures_costo.append('relative')
@@ -1631,7 +1943,7 @@ def page_reporte_variacion_total_obras():
             texts_costo.append(f"${total_asignado_general:,.2f}")
 
             # Check again after adding variation bars if there's more than just the start and end points
-            if len(labels_costo) > 2 or (len(labels_costo) == 2 and values_costo[0] != values_costo[1]): # More than just start/end OR start!=end
+            if len(labels_costo) > 2 or (len(labels_costo) == 2 and abs(values_costo[0] - values_costo[1]) > 0.01): # More than just start/end OR start!=end
                 fig_total_variacion_costo = go.Figure(go.Waterfall(
                     name = "Variación Total Costo",
                     orientation = "v",
@@ -1679,9 +1991,9 @@ def page_reporte_variacion_total_obras():
             for index, row in reporte_variacion_obras_sorted_cantidad.iterrows():
                  # Use shorter label for graph
                  obra_label = row['Nombre_Obra']
-                 if len(obra_label) > 15: # Arbitrary length limit
-                      obra_label = obra_label[:12] + '...'
-                 labels_cantidad.append(f"Var Cant: {obra_label}") # Use Nombre_Obra
+                 if len(obra_label) > 25: # Arbitrary length limit
+                      obra_label = obra_label[:22] + '...'
+                 labels_cantidad.append(f"Var Cant: {obra_label}")
 
                  values_cantidad.append(row['Variacion_Total_Cantidad'])
                  measures_cantidad.append('relative')
@@ -1694,7 +2006,7 @@ def page_reporte_variacion_total_obras():
             texts_cantidad.append(f"{total_cantidad_asignada_general:,.2f}")
 
             # Check again after adding variation bars if there's more than just the start and end points
-            if len(labels_cantidad) > 2 or (len(labels_cantidad) == 2 and values_cantidad[0] != values_cantidad[1]): # More than just start/end OR start!=end
+            if len(labels_cantidad) > 2 or (len(labels_cantidad) == 2 and abs(values_cantidad[0] - values_cantidad[1]) > 0.01): # More than just start/end OR start!=end
                 fig_total_variacion_cantidad = go.Figure(go.Waterfall(
                     name = "Variación Total Cantidad",
                     orientation = "v",
@@ -1723,22 +2035,20 @@ def page_reporte_variacion_total_obras():
 
 # --- Main App Logic (No Auth) ---
 
-# The authentication block is removed.
-# The app now proceeds directly to rendering the sidebar and page content.
-
 # --- Sidebar Navigation ---
 with st.sidebar:
     st.title("Menú Principal")
 
     # Define the pages for navigation
     pages = {
-        "Dashboard Principal": "dashboard", # Simple placeholder
+        "Dashboard Principal": "dashboard",
+        "Gestión de Flotas": "gestion_flotas", # Added Fleet Management page
         "Gestión de Equipos": "equipos",
         "Registro de Consumibles": "consumibles",
         "Registro de Costos Equipos": "costos_equipos",
         "Reportes Mina (Consumo/Costo)": "reportes_mina",
         "Variación Costos Flota": "variacion_costos_flota",
-        "--- Gestión de Obras y Materiales ---": None, # Separador (Not a real page key)
+        "--- Gestión de Obras y Materiales ---": None,
         "Gestión de Obras (Proyectos)": "gestion_obras",
         "Reporte Presupuesto Total Obras": "reporte_presupuesto_total_obras",
         "Gestión Compras y Asignación": "compras_asignacion",
@@ -1751,8 +2061,6 @@ with st.sidebar:
 
 
 # --- Main Content Area based on selection ---
-# This code executes outside the 'with st.sidebar:' block
-
 # Call the function of the selected page
 if selected_page == "dashboard":
     st.title("Dashboard Principal")
@@ -1760,24 +2068,27 @@ if selected_page == "dashboard":
     st.info("Seleccione una opción del menú lateral para comenzar.")
     st.markdown("---")
     st.subheader("Resumen Rápido")
-    # Here you can add quick key metrics
     total_equipos = len(st.session_state.df_equipos)
     total_obras = len(st.session_state.df_proyectos)
-    # Ensure cost calculation functions are robust to empty DFs
+    total_flotas = len(st.session_state.df_flotas) # Add total fleets metric
     total_presupuesto_materiales = calcular_costo_presupuestado(st.session_state.df_presupuesto_materiales.copy())['Costo_Presupuestado'].sum() if not st.session_state.df_presupuesto_materiales.empty else 0
     total_comprado_materiales = calcular_costo_compra(st.session_state.df_compras_materiales.copy())['Costo_Compra'].sum() if not st.session_state.df_compras_materiales.empty else 0
 
-    col_summary1, col_summary2, col_summary3, col_summary4 = st.columns(4)
+    col_summary1, col_summary2, col_summary3, col_summary4, col_summary5 = st.columns(5) # Added a column
     with col_summary1:
         st.metric("Total Equipos", total_equipos)
     with col_summary2:
-         st.metric("Total Obras", total_obras)
+         st.metric("Total Flotas", total_flotas) # Display total fleets
     with col_summary3:
-         st.metric("Presupuesto Materiales Total", f"${total_presupuesto_materiales:,.0f}")
+         st.metric("Total Obras", total_obras)
     with col_summary4:
+         st.metric("Presupuesto Materiales Total", f"${total_presupuesto_materiales:,.0f}")
+    with col_summary5:
          st.metric("Compras Materiales Total", f"${total_comprado_materiales:,.0f}")
 
 
+elif selected_page == "gestion_flotas": # New page routing
+    page_flotas()
 elif selected_page == "equipos":
     page_equipos()
 elif selected_page == "consumibles":
@@ -1797,7 +2108,4 @@ elif selected_page == "compras_asignacion":
 elif selected_page == "reporte_variacion_total_obras":
     page_reporte_variacion_total_obras()
 elif selected_page is None:
-    # If selected_page is None (for separators like "---"), render a placeholder or nothing
     st.empty() # Ensure the main area is empty
-    # Optional: show a generic message if a separator is "selected" (though not clickable as a page)
-    # st.info("Seleccione una página válida del menú lateral.")
