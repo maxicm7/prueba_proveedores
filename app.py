@@ -2,153 +2,220 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 import os
-# import hashlib # No necesario si usas streamlit-authenticator.Hasher
-import streamlit_authenticator as stauth
+import sqlite3 # Import the sqlite3 library
 
 # --- Configuración Inicial ---
 st.set_page_config(layout="wide", page_title="Gestión de Equipos y Obras (Minería)")
 
-# --- Archivos de Datos ---
+# --- Archivos de Datos (Ahora usaremos una base de datos SQLite) ---
 DATA_DIR = "data"
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR)
 
-FILE_EQUIPOS = os.path.join(DATA_DIR, "equipos.xlsx")
-FILE_CONSUMO = os.path.join(DATA_DIR, "consumo.xlsx")
-FILE_COSTOS_SALARIAL = os.path.join(DATA_DIR, "costos_salarial.xlsx")
-FILE_GASTOS_FIJOS = os.path.join(DATA_DIR, "gastos_fijos.xlsx")
-FILE_GASTOS_MANTENIMIENTO = os.path.join(DATA_DIR, "gastos_mantenimiento.xlsx")
-FILE_PRECIOS_COMBUSTIBLE = os.path.join(DATA_DIR, "precios_combustible.xlsx")
-FILE_PROYECTOS = os.path.join(DATA_DIR, "proyectos.xlsx")
-FILE_PRESUPUESTO_MATERIALES = os.path.join(DATA_DIR, "presupuesto_materiales.xlsx")
-FILE_COMPRAS_MATERIALES = os.path.join(DATA_DIR, "compras_materiales.xlsx")
-FILE_ASIGNACION_MATERIALES = os.path.join(DATA_DIR, "asignacion_materiales.xlsx")
+DATABASE_FILE = os.path.join(DATA_DIR, "app_data.db")
 
-# --- Funciones para Cargar/Guardar Datos ---
-# Mejorada para manejar posibles errores al leer
-def load_data(file_path, expected_columns=None):
-    if os.path.exists(file_path):
-        try:
-            df = pd.read_excel(file_path, engine='openpyxl')
-            # Convertir columnas de fecha si existen
-            for col in df.columns:
-                if 'fecha' in col.lower():
-                    try:
-                        df[col] = pd.to_datetime(df[col]).dt.date # Almacenar solo la fecha
-                    except Exception:
-                        # Ignorar errores de conversión si la columna no es una fecha válida
-                        pass
-            # Opcional: Verificar si las columnas esperadas están presentes
-            if expected_columns:
-                missing_cols = [col for col in expected_columns if col not in df.columns]
-                if missing_cols:
-                    st.warning(f"Archivo {file_path} no contiene las columnas esperadas: {missing_cols}. Se usará un DataFrame vacío o se añadirán al guardar.")
-                    return pd.DataFrame(columns=expected_columns) # Retorna vacío si faltan columnas críticas
-            return df
-        except FileNotFoundError:
-            st.warning(f"Archivo no encontrado al intentar cargar: {file_path}")
-            return pd.DataFrame(columns=expected_columns if expected_columns else [])
-        except Exception as e:
-            st.error(f"Error al leer el archivo {file_path}: {e}")
-            return pd.DataFrame(columns=expected_columns if expected_columns else [])
-    return pd.DataFrame(columns=expected_columns if expected_columns else []) # Retorna DataFrame vacío si el archivo no existe
+# Define table names for SQLite
+TABLE_EQUIPOS = "equipos"
+TABLE_CONSUMO = "consumo"
+TABLE_COSTOS_SALARIAL = "costos_salarial"
+TABLE_GASTOS_FIJOS = "gastos_fijos"
+TABLE_GASTOS_MANTENIMIENTO = "gastos_mantenimiento"
+TABLE_PRECIOS_COMBUSTIBLE = "precios_combustible"
+TABLE_PROYECTOS = "proyectos"
+TABLE_PRESUPUESTO_MATERIALES = "presupuesto_materiales"
+TABLE_COMPRAS_MATERIALES = "compras_materiales"
+TABLE_ASIGNACION_MATERIALES = "asignacion_materiales"
 
-def save_data(df, file_path):
-    # Asegurar que el directorio exista antes de guardar
-    data_dir = os.path.dirname(file_path)
-    if not os.path.exists(data_dir):
-        os.makedirs(data_dir)
+
+# --- Helper function to get SQLite connection ---
+def get_db_conn():
+    """Establece y retorna una conexión a la base de datos SQLite."""
+    conn = sqlite3.connect(DATABASE_FILE)
+    return conn
+
+# --- Define expected columns and their pandas dtypes for each table ---
+# This is used to create empty dataframes if tables don't exist and for date handling
+# Use 'object' for dates initially, then convert to datetime/date after loading
+TABLE_COLUMNS = {
+    TABLE_EQUIPOS: {'Interno': 'object', 'Patente': 'object'},
+    TABLE_CONSUMO: {'Interno': 'object', 'Fecha': 'object', 'Consumo_Litros': 'float64', 'Horas_Trabajadas': 'float64', 'Kilometros_Recorridos': 'float64'},
+    TABLE_COSTOS_SALARIAL: {'Interno': 'object', 'Fecha': 'object', 'Monto_Salarial': 'float64'},
+    TABLE_GASTOS_FIJOS: {'Interno': 'object', 'Fecha': 'object', 'Tipo_Gasto_Fijo': 'object', 'Monto_Gasto_Fijo': 'float64', 'Descripcion': 'object'},
+    TABLE_GASTOS_MANTENIMIENTO: {'Interno': 'object', 'Fecha': 'object', 'Tipo_Mantenimiento': 'object', 'Monto_Mantenimiento': 'float64', 'Descripcion': 'object'},
+    TABLE_PRECIOS_COMBUSTIBLE: {'Fecha': 'object', 'Precio_Litro': 'float64'},
+    TABLE_PROYECTOS: {'ID_Obra': 'object', 'Nombre_Obra': 'object', 'Responsable': 'object'},
+    TABLE_PRESUPUESTO_MATERIALES: {'ID_Obra': 'object', 'Material': 'object', 'Cantidad_Presupuestada': 'float64', 'Precio_Unitario_Presupuestado': 'float64', 'Costo_Presupuestado': 'float64'},
+    TABLE_COMPRAS_MATERIALES: {'ID_Compra': 'object', 'Fecha_Compra': 'object', 'Material': 'object', 'Cantidad_Comprada': 'float64', 'Precio_Unitario_Comprado': 'float64', 'Costo_Compra': 'float64'},
+    TABLE_ASIGNACION_MATERIALES: {'ID_Asignacion': 'object', 'Fecha_Asignacion': 'object', 'ID_Obra': 'object', 'Material': 'object', 'Cantidad_Asignada': 'float64', 'Precio_Unitario_Asignado': 'float64', 'Costo_Asignado': 'float64'},
+}
+
+# Define which columns are dates and should be converted
+DATE_COLUMNS = {
+    TABLE_CONSUMO: ['Fecha'],
+    TABLE_COSTOS_SALARIAL: ['Fecha'],
+    TABLE_GASTOS_FIJOS: ['Fecha'],
+    TABLE_GASTOS_MANTENIMIENTO: ['Fecha'],
+    TABLE_PRECIOS_COMBUSTIBLE: ['Fecha'],
+    TABLE_COMPRAS_MATERIALES: ['Fecha_Compra'],
+    TABLE_ASIGNACION_MATERIALES: ['Fecha_Asignacion'],
+    # Proyectos and Equipos tables have no date columns to convert in this list
+}
+
+
+# --- Funciones para Cargar/Guardar Datos usando SQLite ---
+def load_table(db_file, table_name):
+    """Carga datos de una tabla SQLite en un DataFrame."""
+    conn = None # Initialize connection to None
     try:
-        df.to_excel(file_path, index=False, engine='openpyxl')
-        # st.success(f"Datos guardados en {os.path.basename(file_path)}") # Demasiado verboso, comentar
+        conn = get_db_conn()
+        # Check if table exists
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table_name}';")
+        table_exists = cursor.fetchone() is not None
+
+        if table_exists:
+            df = pd.read_sql_query(f'SELECT * FROM "{table_name}"', conn) # Quote table name just in case
+            # Convert date columns
+            if table_name in DATE_COLUMNS:
+                for col in DATE_COLUMNS[table_name]:
+                    if col in df.columns:
+                        # Convert potential strings/objects to datetime, then to date objects
+                        # Use errors='coerce' to turn invalid dates into NaT
+                        df[col] = pd.to_datetime(df[col], errors='coerce').dt.date
+                        # Drop rows where date conversion failed (optional, but keeps data clean)
+                        df.dropna(subset=[col], inplace=True)
+            return df
+        else:
+            st.warning(f"La tabla '{table_name}' no existe en la base de datos. Creando DataFrame vacío con columnas esperadas.")
+            # Return empty DataFrame with expected columns and dtypes
+            expected_cols_types = TABLE_COLUMNS.get(table_name, {})
+            df = pd.DataFrame(columns=expected_cols_types.keys())
+            # Ensure correct dtypes for empty dataframe
+            for col, dtype in expected_cols_types.items():
+                 if col in df.columns:
+                     df[col] = df[col].astype(dtype)
+
+            # If it's a date column in an empty df, the dtype might be 'object'.
+            # When data is added, pandas will infer. We handle conversion on load.
+            return df
+
+    except sqlite3.Error as e:
+        st.error(f"Error al leer la tabla {table_name} de la base de datos: {e}")
+        # Return empty DataFrame with expected columns on error
+        expected_cols_types = TABLE_COLUMNS.get(table_name, {})
+        df = pd.DataFrame(columns=expected_cols_types.keys())
+        for col, dtype in expected_cols_types.items():
+             if col in df.columns:
+                 df[col] = df[col].astype(dtype)
+        return df
+    finally:
+        if conn:
+            conn.close()
+
+def save_table(df, db_file, table_name):
+    """Guarda un DataFrame en una tabla SQLite (reemplazando la tabla si existe)."""
+    conn = None # Initialize connection to None
+    try:
+        conn = get_db_conn()
+        # Convert date objects to string format 'YYYY-MM-DD' before saving
+        if table_name in DATE_COLUMNS:
+            for col in DATE_COLUMNS[table_name]:
+                 if col in df.columns:
+                      # Convert to datetime first to handle potential mixed types, then format as string
+                     df[col] = pd.to_datetime(df[col], errors='coerce').dt.strftime('%Y-%m-%d').fillna('') # Handle NaT by filling with empty string or other marker
+
+        # Use if_exists='replace' to overwrite the table with the current DataFrame content
+        df.to_sql(table_name, conn, if_exists='replace', index=False)
+        conn.commit() # Commit changes
+        # st.success(f"Datos guardados en la tabla {table_name}") # Too verbose, comment
+
+    except sqlite3.Error as e:
+        st.error(f"Error al guardar en la tabla {table_name} en la base de datos: {e}")
     except Exception as e:
-        st.error(f"Error al guardar el archivo {file_path}: {e}")
+         st.error(f"Error general al guardar en la tabla {table_name}: {e}")
+    finally:
+        if conn:
+            conn.close()
 
 
 # --- Cargar todos los DataFrames al inicio (si no están en session_state) ---
 # Usamos st.session_state para mantener los datos a través de las interacciones del usuario
-# Añadimos expected_columns para inicializar correctamente si el archivo no existe o está vacío/corrupto
 
 if 'df_equipos' not in st.session_state:
-    st.session_state.df_equipos = load_data(FILE_EQUIPOS, expected_columns=['Interno', 'Patente'])
+    st.session_state.df_equipos = load_table(DATABASE_FILE, TABLE_EQUIPOS)
 
 if 'df_consumo' not in st.session_state:
-    st.session_state.df_consumo = load_data(FILE_CONSUMO, expected_columns=['Interno', 'Fecha', 'Consumo_Litros', 'Horas_Trabajadas', 'Kilometros_Recorridos'])
-    # Ensure date type, handling potential NaT from empty column or bad data
-    if not st.session_state.df_consumo.empty:
-        st.session_state.df_consumo['Fecha'] = pd.to_datetime(st.session_state.df_consumo['Fecha'], errors='coerce').dt.date.dropna() # Ensure date type and remove invalid dates
+    st.session_state.df_consumo = load_table(DATABASE_FILE, TABLE_CONSUMO)
 
 if 'df_costos_salarial' not in st.session_state:
-    st.session_state.df_costos_salarial = load_data(FILE_COSTOS_SALARIAL, expected_columns=['Interno', 'Fecha', 'Monto_Salarial'])
-    if not st.session_state.df_costos_salarial.empty:
-         st.session_state.df_costos_salarial['Fecha'] = pd.to_datetime(st.session_state.df_costos_salarial['Fecha'], errors='coerce').dt.date.dropna()
+    st.session_state.df_costos_salarial = load_table(DATABASE_FILE, TABLE_COSTOS_SALARIAL)
 
 if 'df_gastos_fijos' not in st.session_state:
-    st.session_state.df_gastos_fijos = load_data(FILE_GASTOS_FIJOS, expected_columns=['Interno', 'Fecha', 'Tipo_Gasto_Fijo', 'Monto_Gasto_Fijo', 'Descripcion'])
-    if not st.session_state.df_gastos_fijos.empty:
-         st.session_state.df_gastos_fijos['Fecha'] = pd.to_datetime(st.session_state.df_gastos_fijos['Fecha'], errors='coerce').dt.date.dropna()
+    st.session_state.df_gastos_fijos = load_table(DATABASE_FILE, TABLE_GASTOS_FIJOS)
 
 if 'df_gastos_mantenimiento' not in st.session_state:
-    st.session_state.df_gastos_mantenimiento = load_data(FILE_GASTOS_MANTENIMIENTO, expected_columns=['Interno', 'Fecha', 'Tipo_Mantenimiento', 'Monto_Mantenimiento', 'Descripcion'])
-    if not st.session_state.df_gastos_mantenimiento.empty:
-         st.session_state.df_gastos_mantenimiento['Fecha'] = pd.to_datetime(st.session_state.df_gastos_mantenimiento['Fecha'], errors='coerce').dt.date.dropna()
+    st.session_state.df_gastos_mantenimiento = load_table(DATABASE_FILE, TABLE_GASTOS_MANTENIMIENTO)
 
 if 'df_precios_combustible' not in st.session_state:
-    st.session_state.df_precios_combustible = load_data(FILE_PRECIOS_COMBUSTIBLE, expected_columns=['Fecha', 'Precio_Litro'])
-    if not st.session_state.df_precios_combustible.empty:
-         st.session_state.df_precios_combustible['Fecha'] = pd.to_datetime(st.session_state.df_precios_combustible['Fecha'], errors='coerce').dt.date.dropna()
+    st.session_state.df_precios_combustible = load_table(DATABASE_FILE, TABLE_PRECIOS_COMBUSTIBLE)
 
 if 'df_proyectos' not in st.session_state:
-    st.session_state.df_proyectos = load_data(FILE_PROYECTOS, expected_columns=['ID_Obra', 'Nombre_Obra', 'Responsable'])
-    if st.session_state.df_proyectos.empty:
-         st.session_state.df_proyectos['ID_Obra'] = [] # Ensure ID column exists even if empty
+    st.session_state.df_proyectos = load_table(DATABASE_FILE, TABLE_PROYECTOS)
+    # Ensure ID column exists even if empty
+    if st.session_state.df_proyectos.empty or 'ID_Obra' not in st.session_state.df_proyectos.columns:
+         st.session_state.df_proyectos = pd.DataFrame(columns=TABLE_COLUMNS[TABLE_PROYECTOS].keys()) # Re-create with expected columns
 
 if 'df_presupuesto_materiales' not in st.session_state:
-    st.session_state.df_presupuesto_materiales = load_data(FILE_PRESUPUESTO_MATERIALES, expected_columns=['ID_Obra', 'Material', 'Cantidad_Presupuestada', 'Precio_Unitario_Presupuestado'])
+    st.session_state.df_presupuesto_materiales = load_table(DATABASE_FILE, TABLE_PRESUPUESTO_MATERIALES)
+    # Ensure calculated column exists
     if 'Costo_Presupuestado' not in st.session_state.df_presupuesto_materiales.columns:
-         st.session_state.df_presupuesto_materiales['Costo_Presupuestado'] = 0.0 # Add column if missing
+         st.session_state.df_presupuesto_materiales['Costo_Presupuestado'] = 0.0
 
 if 'df_compras_materiales' not in st.session_state:
-    st.session_state.df_compras_materiales = load_data(FILE_COMPRAS_MATERIALES, expected_columns=['ID_Compra', 'Fecha_Compra', 'Material', 'Cantidad_Comprada', 'Precio_Unitario_Comprado'])
+    st.session_state.df_compras_materiales = load_table(DATABASE_FILE, TABLE_COMPRAS_MATERIALES)
+    # Ensure calculated column and ID column exist/are unique if needed
     if 'Costo_Compra' not in st.session_state.df_compras_materiales.columns:
-         st.session_state.df_compras_materiales['Costo_Compra'] = 0.0 # Add column if missing
-    if 'ID_Compra' not in st.session_state.df_compras_materiales.columns or st.session_state.df_compras_materiales['ID_Compra'].nunique() != len(st.session_state.df_compras_materiales):
-         # Regenerate simple unique IDs if needed (e.g., loaded from file without unique IDs)
-         st.session_state.df_compras_materiales['ID_Compra'] = [f"COMPRA_{int(pd.Timestamp.now().timestamp() * 1000)}_{i}" for i in range(len(st.session_state.df_compras_materiales))]
+         st.session_state.df_compras_materiales['Costo_Compra'] = 0.0
+    # Simple check/re-generation of IDs if loaded data doesn't have them or they aren't unique
+    # This might be too aggressive; unique IDs should ideally be generated *on creation*
+    # Let's keep the ID generation only on form submission for new rows.
+    # Ensure the column exists though:
+    if 'ID_Compra' not in st.session_state.df_compras_materiales.columns:
+        st.session_state.df_compras_materiales['ID_Compra'] = [f"COMPRA_OLD_{i}" for i in range(len(st.session_state.df_compras_materiales))]
+
 
 if 'df_asignacion_materiales' not in st.session_state:
-    st.session_state.df_asignacion_materiales = load_data(FILE_ASIGNACION_MATERIALES, expected_columns=['ID_Asignacion', 'Fecha_Asignacion', 'ID_Obra', 'Material', 'Cantidad_Asignada', 'Precio_Unitario_Asignado'])
+    st.session_state.df_asignacion_materiales = load_table(DATABASE_FILE, TABLE_ASIGNACION_MATERIALES)
+    # Ensure calculated column and ID column exist
     if 'Costo_Asignado' not in st.session_state.df_asignacion_materiales.columns:
-         st.session_state.df_asignacion_materiales['Costo_Asignado'] = 0.0 # Add column if missing
-    if 'ID_Asignacion' not in st.session_state.df_asignacion_materiales.columns or st.session_state.df_asignacion_materiales['ID_Asignacion'].nunique() != len(st.session_state.df_asignacion_materiales):
-         # Regenerate simple unique IDs if needed
-         st.session_state.df_asignacion_materiales['ID_Asignacion'] = [f"ASIG_{int(pd.Timestamp.now().timestamp() * 1000)}_{i}" for i in range(len(st.session_state.df_asignacion_materiales))]
+         st.session_state.df_asignacion_materiales['Costo_Asignado'] = 0.0
+    # Ensure the column exists though:
+    if 'ID_Asignacion' not in st.session_state.df_asignacion_materiales.columns:
+        st.session_state.df_asignacion_materiales['ID_Asignacion'] = [f"ASIG_OLD_{i}" for i in range(len(st.session_state.df_asignacion_materiales))]
 
 
 # --- Helper para calcular costos ---
 # Se asegura de no fallar si alguna columna falta temporalmente
 def calcular_costo_presupuestado(df):
     """Calcula el costo total presupuestado por fila."""
-    if 'Cantidad_Presupuestada' in df.columns and 'Precio_Unitario_Presupuestado' in df.columns:
-        df['Costo_Presupuestado'] = df['Cantidad_Presupuestada'] * df['Precio_Unitario_Presupuestado']
-    else:
-        df['Costo_Presupuestado'] = 0.0 # Añadir columna si no existe
+    # Ensure columns are numeric, coerce errors to handle potential non-numeric input from editor
+    df['Cantidad_Presupuestada'] = pd.to_numeric(df.get('Cantidad_Presupuestada', 0), errors='coerce').fillna(0)
+    df['Precio_Unitario_Presupuestado'] = pd.to_numeric(df.get('Precio_Unitario_Presupuestado', 0), errors='coerce').fillna(0)
+    df['Costo_Presupuestado'] = df['Cantidad_Presupuestada'] * df['Precio_Unitario_Presupuestado']
     return df
 
 def calcular_costo_compra(df):
     """Calcula el costo total de compra por fila."""
-    if 'Cantidad_Comprada' in df.columns and 'Precio_Unitario_Comprado' in df.columns:
-        df['Costo_Compra'] = df['Cantidad_Comprada'] * df['Precio_Unitario_Comprado']
-    else:
-        df['Costo_Compra'] = 0.0 # Añadir columna si no existe
+    df['Cantidad_Comprada'] = pd.to_numeric(df.get('Cantidad_Comprada', 0), errors='coerce').fillna(0)
+    df['Precio_Unitario_Comprado'] = pd.to_numeric(df.get('Precio_Unitario_Comprado', 0), errors='coerce').fillna(0)
+    df['Costo_Compra'] = df['Cantidad_Comprada'] * df['Precio_Unitario_Comprado']
     return df
 
 def calcular_costo_asignado(df):
     """Calcula el costo total asignado por fila."""
-    if 'Cantidad_Asignada' in df.columns and 'Precio_Unitario_Asignado' in df.columns:
-        df['Costo_Asignado'] = df['Cantidad_Asignada'] * df['Precio_Unitario_Asignado']
-    else:
-        df['Costo_Asignado'] = 0.0 # Añadir columna si no existe
+    df['Cantidad_Asignada'] = pd.to_numeric(df.get('Cantidad_Asignada', 0), errors='coerce').fillna(0)
+    df['Precio_Unitario_Asignado'] = pd.to_numeric(df.get('Precio_Unitario_Asignado', 0), errors='coerce').fillna(0)
+    df['Costo_Asignado'] = df['Cantidad_Asignada'] * df['Precio_Unitario_Asignado']
     return df
 
 
@@ -161,37 +228,12 @@ if not st.session_state.df_asignacion_materiales.empty:
     st.session_state.df_asignacion_materiales = calcular_costo_asignado(st.session_state.df_asignacion_materiales)
 
 
-# --- Configuración de Usuarios y Autenticación ---
-# Usa hash_gen.py para generar estos hashes:
-# import streamlit_authenticator as stauth
-# passwords = ['contraseña_user1', 'contraseña_user2', 'contraseña_user3', 'contraseña_user4'] # Reemplaza con las contraseñas reales
-# hashed = stauth.Hasher(passwords).generate()
-# print(hashed)
-hashed_passwords = [
-    # PEGA AQUÍ LOS HASHES GENERADOS
-    '$2b$12$EXAMPLEHASHFORUSER1HERE..................', # Hash para user1
-    '$2b$12$EXAMPLEHASHFORUSER2HERE..................', # Hash para user2
-    '$2b$12$EXAMPLEHASHFORUSER3HERE..................', # Hash para user3
-    '$2b$12$EXAMPLEHASHFORUSER4HERE..................'  # Hash para user4
-]
+# --- Authentication Removed ---
+# The authentication setup and login/logout calls are removed.
+# The sidebar and page content logic will now run unconditionally.
 
 
-authenticator = stauth.Authenticate(
-    {
-        'usernames':{
-            'user1':{'name':'Usuario Uno','password':hashed_passwords[0]},
-            'user2':{'name':'Usuario Dos','password':hashed_passwords[1]},
-            'user3':{'name':'Usuario Tres','password':hashed_passwords[2]},
-            'user4':{'name':'Usuario Cuatro','password':hashed_passwords[3]}
-        }
-    },
-    'mining_dashboard_cookie', # Nombre de la cookie
-    'abcdefgh', # Clave de la cookie (CÁMBIALA por una cadena aleatoria segura de al menos 32 caracteres)
-    cookie_expiry_days=30
-)
-
-
-# --- Funciones para cada "Página" (sin cambios, se llaman desde el flujo principal) ---
+# --- Funciones para cada "Página" ---
 
 def page_equipos():
     st.title("Gestión de Equipos de Mina")
@@ -209,7 +251,7 @@ def page_equipos():
                 else:
                     new_equipo = pd.DataFrame([{'Interno': interno, 'Patente': patente}])
                     st.session_state.df_equipos = pd.concat([st.session_state.df_equipos, new_equipo], ignore_index=True)
-                    save_data(st.session_state.df_equipos, FILE_EQUIPOS)
+                    save_table(st.session_state.df_equipos, DATABASE_FILE, TABLE_EQUIPOS) # Save to DB
                     st.success(f"Equipo {interno} ({patente}) añadido.")
             else:
                 st.warning("Por favor, complete Interno y Patente.")
@@ -229,18 +271,18 @@ def page_equipos():
 
     # Lógica para guardar cambios del data_editor
     # Comparar con el original para ver si hay cambios significativos (evitar guardar innecesariamente)
-    # Esto es un poco complejo, una forma simple es siempre reemplazar el DF en session_state
-    # si el editor devuelve algo diferente.
     if not df_equipos_edited.equals(st.session_state.df_equipos):
          st.session_state.df_equipos = df_equipos_edited
+         # Auto-save on change detected (can be slow for large data), or require a button click.
+         # Button click is safer for validation and user control.
          if st.button("Guardar Cambios en Lista de Equipos"):
-              # Validar antes de guardar (ej. Internos únicos)
+              # Validar antes de guardar (ej. Internos únicos, no vacíos)
               if st.session_state.df_equipos['Interno'].duplicated().any():
                   st.error("Error: Hay Internos de Equipo duplicados en la lista. Por favor, corrija los duplicados antes de guardar.")
               elif st.session_state.df_equipos['Interno'].isnull().any() or st.session_state.df_equipos['Patente'].isnull().any():
                   st.error("Error: Hay campos 'Interno' o 'Patente' vacíos. Por favor, complete la información faltante.")
               else:
-                  save_data(st.session_state.df_equipos, FILE_EQUIPOS)
+                  save_table(st.session_state.df_equipos, DATABASE_FILE, TABLE_EQUIPOS) # Save to DB
                   st.success("Cambios en la lista de equipos guardados.")
          else:
              st.info("Hay cambios sin guardar en la lista de equipos.") # Feedback al usuario
@@ -269,32 +311,50 @@ def page_consumibles():
             if interno_seleccionado and fecha and (consumo_litros > 0 or horas_trabajadas > 0 or kilometros_recorridos > 0):
                  new_consumo = pd.DataFrame([{
                     'Interno': interno_seleccionado,
-                    'Fecha': fecha,
+                    'Fecha': fecha, # Will be converted to string by save_table
                     'Consumo_Litros': consumo_litros,
                     'Horas_Trabajadas': horas_trabajadas,
                     'Kilometros_Recorridos': kilometros_recorridos
                  }])
-                 new_consumo['Fecha'] = pd.to_datetime(new_consumo['Fecha']).dt.date
+                 # Date conversion handled by save_table before saving, load_table after loading
 
                  st.session_state.df_consumo = pd.concat([st.session_state.df_consumo, new_consumo], ignore_index=True)
-                 save_data(st.session_state.df_consumo, FILE_CONSUMO)
+                 save_table(st.session_state.df_consumo, DATABASE_FILE, TABLE_CONSUMO) # Save to DB
                  st.success("Registro de consumo añadido.")
             else:
                 st.warning("Por favor, complete todos los campos y añada al menos un valor (Litros, Horas o Kilómetros).")
 
     st.subheader("Registros de Consumo Existente")
     df_consumo_editable = st.session_state.df_consumo.copy()
+    # Ensure Fecha is datetime for data_editor if it was loaded as date objects
+    if 'Fecha' in df_consumo_editable.columns:
+        df_consumo_editable['Fecha'] = pd.to_datetime(df_consumo_editable['Fecha'])
+
     df_consumo_edited = st.data_editor(
          df_consumo_editable,
          key="data_editor_consumo",
-         num_rows="dynamic"
-         # Column config could be added here for specific types/formats
+         num_rows="dynamic",
+         column_config={
+              "Fecha": st.column_config.DateColumn("Fecha", required=True),
+              "Interno": st.column_config.TextColumn("Interno", required=True),
+              "Consumo_Litros": st.column_config.NumberColumn("Consumo Litros", min_value=0.0, format="%.2f", required=True),
+              "Horas_Trabajadas": st.column_config.NumberColumn("Horas Trabajadas", min_value=0.0, format="%.2f", required=True),
+              "Kilometros_Recorridos": st.column_config.NumberColumn("Kilómetros Recorridos", min_value=0.0, format="%.2f", required=True),
+         }
      )
-    if not df_consumo_edited.equals(st.session_state.df_consumo):
-         st.session_state.df_consumo = df_consumo_edited
+    if not df_consumo_edited.equals(df_consumo_editable): # Compare with the version before editor
+         st.session_state.df_consumo = df_consumo_edited.copy()
+         # Convert date column back to date objects for internal consistency in session state
+         if 'Fecha' in st.session_state.df_consumo.columns:
+             st.session_state.df_consumo['Fecha'] = pd.to_datetime(st.session_state.df_consumo['Fecha'], errors='coerce').dt.date.dropna()
+
          if st.button("Guardar Cambios en Registros de Consumo"):
-              save_data(st.session_state.df_consumo, FILE_CONSUMO)
-              st.success("Cambios en registros de consumo guardados.")
+              # Basic validation
+              if st.session_state.df_consumo['Interno'].isnull().any() or st.session_state.df_consumo['Fecha'].isnull().any():
+                   st.error("Error: Campos obligatorios (Interno, Fecha) no pueden estar vacíos.")
+              else:
+                   save_table(st.session_state.df_consumo, DATABASE_FILE, TABLE_CONSUMO) # Save to DB
+                   st.success("Cambios en registros de consumo guardados.")
          else:
              st.info("Hay cambios sin guardar en registros de consumo.")
 
@@ -322,27 +382,38 @@ def page_costos_equipos():
                 if interno_seleccionado and fecha and monto_salarial > 0:
                     new_costo = pd.DataFrame([{
                        'Interno': interno_seleccionado,
-                       'Fecha': fecha,
+                       'Fecha': fecha, # Handled by save_table
                        'Monto_Salarial': monto_salarial
                     }])
-                    new_costo['Fecha'] = pd.to_datetime(new_costo['Fecha']).dt.date
                     st.session_state.df_costos_salarial = pd.concat([st.session_state.df_costos_salarial, new_costo], ignore_index=True)
-                    save_data(st.session_state.df_costos_salarial, FILE_COSTOS_SALARIAL)
+                    save_table(st.session_state.df_costos_salarial, DATABASE_FILE, TABLE_COSTOS_SALARIAL) # Save to DB
                     st.success("Costo salarial registrado.")
                 else:
                     st.warning("Por favor, complete todos los campos.")
         st.subheader("Registros Salariales Existente")
         df_salarial_editable = st.session_state.df_costos_salarial.copy()
+        if 'Fecha' in df_salarial_editable.columns:
+             df_salarial_editable['Fecha'] = pd.to_datetime(df_salarial_editable['Fecha'])
         df_salarial_edited = st.data_editor(
             df_salarial_editable,
             key="data_editor_salarial",
-            num_rows="dynamic"
+            num_rows="dynamic",
+             column_config={
+                 "Fecha": st.column_config.DateColumn("Fecha", required=True),
+                 "Interno": st.column_config.TextColumn("Interno", required=True),
+                 "Monto_Salarial": st.column_config.NumberColumn("Monto Salarial", min_value=0.0, format="%.2f", required=True),
+             }
         )
-        if not df_salarial_edited.equals(st.session_state.df_costos_salarial):
-             st.session_state.df_costos_salarial = df_salarial_edited
+        if not df_salarial_edited.equals(df_salarial_editable):
+             st.session_state.df_costos_salarial = df_salarial_edited.copy()
+             if 'Fecha' in st.session_state.df_costos_salarial.columns:
+                 st.session_state.df_costos_salarial['Fecha'] = pd.to_datetime(st.session_state.df_costos_salarial['Fecha'], errors='coerce').dt.date.dropna()
              if st.button("Guardar Cambios en Registros Salariales"):
-                 save_data(st.session_state.df_costos_salarial, FILE_COSTOS_SALARIAL)
-                 st.success("Cambios en registros salariales guardados.")
+                  if st.session_state.df_costos_salarial['Interno'].isnull().any() or st.session_state.df_costos_salarial['Fecha'].isnull().any() or st.session_state.df_costos_salarial['Monto_Salarial'].isnull().any():
+                       st.error("Error: Campos obligatorios no pueden estar vacíos.")
+                  else:
+                       save_table(st.session_state.df_costos_salarial, DATABASE_FILE, TABLE_COSTOS_SALARIAL) # Save to DB
+                       st.success("Cambios en registros salariales guardados.")
              else:
                  st.info("Hay cambios sin guardar en registros salariales.")
 
@@ -360,29 +431,42 @@ def page_costos_equipos():
                 if interno_seleccionado and fecha and monto_gasto > 0 and tipo_gasto:
                     new_gasto = pd.DataFrame([{
                        'Interno': interno_seleccionado,
-                       'Fecha': fecha,
+                       'Fecha': fecha, # Handled by save_table
                        'Tipo_Gasto_Fijo': tipo_gasto,
                        'Monto_Gasto_Fijo': monto_gasto,
                        'Descripcion': descripcion
                     }])
-                    new_gasto['Fecha'] = pd.to_datetime(new_gasto['Fecha']).dt.date
                     st.session_state.df_gastos_fijos = pd.concat([st.session_state.df_gastos_fijos, new_gasto], ignore_index=True)
-                    save_data(st.session_state.df_gastos_fijos, FILE_GASTOS_FIJOS)
+                    save_table(st.session_state.df_gastos_fijos, DATABASE_FILE, TABLE_GASTOS_FIJOS) # Save to DB
                     st.success("Gasto fijo registrado.")
                 else:
                     st.warning("Por favor, complete los campos obligatorios (Equipo, Fecha, Tipo, Monto).")
         st.subheader("Registros de Gastos Fijos Existente")
         df_fijos_editable = st.session_state.df_gastos_fijos.copy()
+        if 'Fecha' in df_fijos_editable.columns:
+             df_fijos_editable['Fecha'] = pd.to_datetime(df_fijos_editable['Fecha'])
         df_fijos_edited = st.data_editor(
             df_fijos_editable,
             key="data_editor_fijos",
-            num_rows="dynamic"
+            num_rows="dynamic",
+            column_config={
+                 "Fecha": st.column_config.DateColumn("Fecha", required=True),
+                 "Interno": st.column_config.TextColumn("Interno", required=True),
+                 "Tipo_Gasto_Fijo": st.column_config.TextColumn("Tipo Gasto Fijo", required=True),
+                 "Monto_Gasto_Fijo": st.column_config.NumberColumn("Monto Gasto Fijo", min_value=0.0, format="%.2f", required=True),
+                 "Descripcion": st.column_config.TextColumn("Descripción", required=False),
+             }
         )
-        if not df_fijos_edited.equals(st.session_state.df_gastos_fijos):
-             st.session_state.df_gastos_fijos = df_fijos_edited
+        if not df_fijos_edited.equals(df_fijos_editable):
+             st.session_state.df_gastos_fijos = df_fijos_edited.copy()
+             if 'Fecha' in st.session_state.df_gastos_fijos.columns:
+                  st.session_state.df_gastos_fijos['Fecha'] = pd.to_datetime(st.session_state.df_gastos_fijos['Fecha'], errors='coerce').dt.date.dropna()
              if st.button("Guardar Cambios en Registros de Gastos Fijos"):
-                 save_data(st.session_state.df_gastos_fijos, FILE_GASTOS_FIJOS)
-                 st.success("Cambios en registros de gastos fijos guardados.")
+                  if st.session_state.df_gastos_fijos['Interno'].isnull().any() or st.session_state.df_gastos_fijos['Fecha'].isnull().any() or st.session_state.df_gastos_fijos['Tipo_Gasto_Fijo'].isnull().any() or st.session_state.df_gastos_fijos['Monto_Gasto_Fijo'].isnull().any():
+                       st.error("Error: Campos obligatorios no pueden estar vacíos.")
+                  else:
+                       save_table(st.session_state.df_gastos_fijos, DATABASE_FILE, TABLE_GASTOS_FIJOS) # Save to DB
+                       st.success("Cambios en registros de gastos fijos guardados.")
              else:
                  st.info("Hay cambios sin guardar en registros de gastos fijos.")
 
@@ -400,29 +484,42 @@ def page_costos_equipos():
                 if interno_seleccionado and fecha and monto_mantenimiento > 0 and tipo_mantenimiento:
                     new_gasto = pd.DataFrame([{
                        'Interno': interno_seleccionado,
-                       'Fecha': fecha,
+                       'Fecha': fecha, # Handled by save_table
                        'Tipo_Mantenimiento': tipo_mantenimiento,
                        'Monto_Mantenimiento': monto_mantenimiento,
                        'Descripcion': descripcion
                     }])
-                    new_gasto['Fecha'] = pd.to_datetime(new_gasto['Fecha']).dt.date
                     st.session_state.df_gastos_mantenimiento = pd.concat([st.session_state.df_gastos_mantenimiento, new_gasto], ignore_index=True)
-                    save_data(st.session_state.df_gastos_mantenimiento, FILE_GASTOS_MANTENIMIENTO)
+                    save_table(st.session_state.df_gastos_mantenimiento, DATABASE_FILE, TABLE_GASTOS_MANTENIMIENTO) # Save to DB
                     st.success("Gasto de mantenimiento registrado.")
                 else:
                     st.warning("Por favor, complete los campos obligatorios (Equipo, Fecha, Tipo, Monto).")
         st.subheader("Registros de Gastos de Mantenimiento Existente")
         df_mantenimiento_editable = st.session_state.df_gastos_mantenimiento.copy()
+        if 'Fecha' in df_mantenimiento_editable.columns:
+             df_mantenimiento_editable['Fecha'] = pd.to_datetime(df_mantenimiento_editable['Fecha'])
         df_mantenimiento_edited = st.data_editor(
             df_mantenimiento_editable,
             key="data_editor_mantenimiento",
-            num_rows="dynamic"
+            num_rows="dynamic",
+            column_config={
+                 "Fecha": st.column_config.DateColumn("Fecha", required=True),
+                 "Interno": st.column_config.TextColumn("Interno", required=True),
+                 "Tipo_Mantenimiento": st.column_config.TextColumn("Tipo Mantenimiento", required=True),
+                 "Monto_Mantenimiento": st.column_config.NumberColumn("Monto Mantenimiento", min_value=0.0, format="%.2f", required=True),
+                 "Descripcion": st.column_config.TextColumn("Descripción", required=False),
+             }
         )
-        if not df_mantenimiento_edited.equals(st.session_state.df_gastos_mantenimiento):
-             st.session_state.df_gastos_mantenimiento = df_mantenimiento_edited
+        if not df_mantenimiento_edited.equals(df_mantenimiento_editable):
+             st.session_state.df_gastos_mantenimiento = df_mantenimiento_edited.copy()
+             if 'Fecha' in st.session_state.df_gastos_mantenimiento.columns:
+                  st.session_state.df_gastos_mantenimiento['Fecha'] = pd.to_datetime(st.session_state.df_gastos_mantenimiento['Fecha'], errors='coerce').dt.date.dropna()
              if st.button("Guardar Cambios en Registros de Mantenimiento"):
-                 save_data(st.session_state.df_gastos_mantenimiento, FILE_GASTOS_MANTENIMIENTO)
-                 st.success("Cambios en registros de mantenimiento guardados.")
+                  if st.session_state.df_gastos_mantenimiento['Interno'].isnull().any() or st.session_state.df_gastos_mantenimiento['Fecha'].isnull().any() or st.session_state.df_gastos_mantenimiento['Tipo_Mantenimiento'].isnull().any() or st.session_state.df_gastos_mantenimiento['Monto_Mantenimiento'].isnull().any():
+                       st.error("Error: Campos obligatorios no pueden estar vacíos.")
+                  else:
+                       save_table(st.session_state.df_gastos_mantenimiento, DATABASE_FILE, TABLE_GASTOS_MANTENIMIENTO) # Save to DB
+                       st.success("Cambios en registros de mantenimiento guardados.")
              else:
                  st.info("Hay cambios sin guardar en registros de mantenimiento.")
 
@@ -438,105 +535,166 @@ def page_reportes_mina():
         submitted = st.form_submit_button("Registrar Precio")
         if submitted:
             if fecha_precio and precio_litro > 0:
-                new_precio = pd.DataFrame([{'Fecha': fecha_precio, 'Precio_Litro': precio_litro}])
-                new_precio['Fecha'] = pd.to_datetime(new_precio['Fecha']).dt.date
+                new_precio = pd.DataFrame([{'Fecha': fecha_precio, 'Precio_Litro': precio_litro}]) # Handled by save_table
                 # Reemplazar si la fecha ya existe, de lo contrario añadir
-                st.session_state.df_precios_combustible = st.session_state.df_precios_combustible[
-                    st.session_state.df_precios_combustible['Fecha'] != fecha_precio
-                ]
+                # Need to convert session_state dates to comparable format if they are date objects
+                df_precios_temp = st.session_state.df_precios_combustible.copy()
+                if 'Fecha' in df_precios_temp.columns:
+                     # Convert both sides to string or comparable type for accurate comparison
+                     df_precios_temp['Fecha_str'] = pd.to_datetime(df_precios_temp['Fecha'], errors='coerce').dt.strftime('%Y-%m-%d')
+                     fecha_precio_str = pd.to_datetime(fecha_precio, errors='coerce').strftime('%Y-%m-%d')
+
+                     st.session_state.df_precios_combustible = df_precios_temp[
+                         df_precios_temp['Fecha_str'] != fecha_precio_str
+                     ].drop(columns=['Fecha_str']) # Drop temp column
+
                 st.session_state.df_precios_combustible = pd.concat([st.session_state.df_precios_combustible, new_precio], ignore_index=True)
-                save_data(st.session_state.df_precios_combustible, FILE_PRECIOS_COMBUSTIBLE)
+                save_table(st.session_state.df_precios_combustible, DATABASE_FILE, TABLE_PRECIOS_COMBUSTIBLE) # Save to DB
                 st.success("Precio del combustible registrado/actualizado.")
             else:
                 st.warning("Por favor, complete la fecha y el precio.")
     st.subheader("Precios del Combustible Existente")
     df_precios_editable = st.session_state.df_precios_combustible.copy()
+    if 'Fecha' in df_precios_editable.columns:
+         df_precios_editable['Fecha'] = pd.to_datetime(df_precios_editable['Fecha'])
     df_precios_edited = st.data_editor(
         df_precios_editable,
         key="data_editor_precios",
-        num_rows="dynamic"
+        num_rows="dynamic",
+        column_config={
+            "Fecha": st.column_config.DateColumn("Fecha", required=True),
+            "Precio_Litro": st.column_config.NumberColumn("Precio por Litro", min_value=0.01, format="%.2f", required=True),
+        }
     )
-    if not df_precios_edited.equals(st.session_state.df_precios_combustible):
-         st.session_state.df_precios_combustible = df_precios_edited
+    if not df_precios_edited.equals(df_precios_editable):
+         st.session_state.df_precios_combustible = df_precios_edited.copy()
+         if 'Fecha' in st.session_state.df_precios_combustible.columns:
+             st.session_state.df_precios_combustible['Fecha'] = pd.to_datetime(st.session_state.df_precios_combustible['Fecha'], errors='coerce').dt.date.dropna()
+
          if st.button("Guardar Cambios en Precios de Combustible"):
               # Opcional: Validar fechas únicas si cada fecha debe tener un solo precio
-              if st.session_state.df_precios_combustible['Fecha'].duplicated().any():
-                   st.error("Error: Hay fechas duplicadas en los precios de combustible. Por favor, corrija los duplicados antes de guardar.")
-              else:
-                   save_data(st.session_state.df_precios_combustible, FILE_PRECIOS_COMBUSTIBLE)
-                   st.success("Cambios en precios de combustible guardados.")
+              # Need to check duplicates based on date object or string representation
+              df_temp_check = st.session_state.df_precios_combustible.copy()
+              if 'Fecha' in df_temp_check.columns:
+                   df_temp_check['Fecha_str'] = pd.to_datetime(df_temp_check['Fecha'], errors='coerce').dt.strftime('%Y-%m-%d')
+                   if df_temp_check['Fecha_str'].duplicated().any():
+                       st.error("Error: Hay fechas duplicadas en los precios de combustible. Por favor, corrija los duplicados antes de guardar.")
+                       return # Stop saving if duplicates found
+              save_table(st.session_state.df_precios_combustible, DATABASE_FILE, TABLE_PRECIOS_COMBUSTIBLE) # Save to DB
+              st.success("Cambios en precios de combustible guardados.")
          else:
              st.info("Hay cambios sin guardar en precios de combustible.")
 
 
     st.subheader("Reporte por Rango de Fechas")
     col1, col2 = st.columns(2)
-    min_date = pd.to_datetime(st.session_state.df_consumo['Fecha']).min() if not st.session_state.df_consumo.empty else pd.Timestamp.now().date()
-    max_date = pd.to_datetime(st.session_state.df_consumo['Fecha']).max() if not st.session_state.df_consumo.empty else pd.Timestamp.now().date()
+
+    # Ensure dates in session state DFs are datetime or date objects for min/max
+    min_date_cons = pd.to_datetime(st.session_state.df_consumo['Fecha'], errors='coerce').dropna().min() if not st.session_state.df_consumo.empty and 'Fecha' in st.session_state.df_consumo.columns else pd.Timestamp.now().date()
+    min_date_sal = pd.to_datetime(st.session_state.df_costos_salarial['Fecha'], errors='coerce').dropna().min() if not st.session_state.df_costos_salarial.empty and 'Fecha' in st.session_state.df_costos_salarial.columns else pd.Timestamp.now().date()
+    min_date_fij = pd.to_datetime(st.session_state.df_gastos_fijos['Fecha'], errors='coerce').dropna().min() if not st.session_state.df_gastos_fijos.empty and 'Fecha' in st.session_state.df_gastos_fijos.columns else pd.Timestamp.now().date()
+    min_date_mant = pd.to_datetime(st.session_state.df_gastos_mantenimiento['Fecha'], errors='coerce').dropna().min() if not st.session_state.df_gastos_mantenimiento.empty and 'Fecha' in st.session_state.df_gastos_mantenimiento.columns else pd.Timestamp.now().date()
+    min_date_pre = pd.to_datetime(st.session_state.df_precios_combustible['Fecha'], errors='coerce').dropna().min() if not st.session_state.df_precios_combustible.empty and 'Fecha' in st.session_state.df_precios_combustible.columns else pd.Timestamp.now().date()
+
+    max_date_cons = pd.to_datetime(st.session_state.df_consumo['Fecha'], errors='coerce').dropna().max() if not st.session_state.df_consumo.empty and 'Fecha' in st.session_state.df_consumo.columns else pd.Timestamp.now().date()
+    max_date_sal = pd.to_datetime(st.session_state.df_costos_salarial['Fecha'], errors='coerce').dropna().max() if not st.session_state.df_costos_salarial.empty and 'Fecha' in st.session_state.df_costos_salarial.columns else pd.Timestamp.now().date()
+    max_date_fij = pd.to_datetime(st.session_state.df_gastos_fijos['Fecha'], errors='coerce').dropna().max() if not st.session_state.df_gastos_fijos.empty and 'Fecha' in st.session_state.df_gastos_fijos.columns else pd.Timestamp.now().date()
+    max_date_mant = pd.to_datetime(st.session_state.df_gastos_mantenimiento['Fecha'], errors='coerce').dropna().max() if not st.session_state.df_gastos_mantenimiento.empty and 'Fecha' in st.session_state.df_gastos_mantenimiento.columns else pd.Timestamp.now().date()
+    max_date_pre = pd.to_datetime(st.session_state.df_precios_combustible['Fecha'], errors='coerce').dropna().max() if not st.session_state.df_precios_combustible.empty and 'Fecha' in st.session_state.df_precios_combustible.columns else pd.Timestamp.now().date()
+
+    # Determine the overall min/max date across relevant dataframes
+    all_relevant_dates = pd.to_datetime([]).date # Start with empty Series of date objects
+    if not st.session_state.df_consumo.empty and 'Fecha' in st.session_state.df_consumo.columns:
+         all_relevant_dates = all_relevant_dates.union(pd.to_datetime(st.session_state.df_consumo['Fecha'], errors='coerce').dropna().dt.date)
+    if not st.session_state.df_costos_salarial.empty and 'Fecha' in st.session_state.df_costos_salarial.columns:
+         all_relevant_dates = all_relevant_dates.union(pd.to_datetime(st.session_state.df_costos_salarial['Fecha'], errors='coerce').dropna().dt.date)
+    if not st.session_state.df_gastos_fijos.empty and 'Fecha' in st.session_state.df_gastos_fijos.columns:
+         all_relevant_dates = all_relevant_dates.union(pd.to_datetime(st.session_state.df_gastos_fijos['Fecha'], errors='coerce').dropna().dt.date)
+    if not st.session_state.df_gastos_mantenimiento.empty and 'Fecha' in st.session_state.df_gastos_mantenimiento.columns:
+         all_relevant_dates = all_relevant_dates.union(pd.to_datetime(st.session_state.df_gastos_mantenimiento['Fecha'], errors='coerce').dropna().dt.date)
+    if not st.session_state.df_precios_combustible.empty and 'Fecha' in st.session_state.df_precios_combustible.columns:
+         all_relevant_dates = all_relevant_dates.union(pd.to_datetime(st.session_state.df_precios_combustible['Fecha'], errors='coerce').dropna().dt.date)
+
+    min_app_date = min(all_relevant_dates) if not all_relevant_dates.empty else pd.Timestamp.now().date() - pd.Timedelta(days=365) # Default to a year ago
+    max_app_date = max(all_relevant_dates) if not all_relevant_dates.empty else pd.Timestamp.now().date() # Default to today
+
+    # Ensure date inputs have valid default values within possible range
+    default_start = max_app_date - pd.Timedelta(days=30) if max_app_date - pd.Timedelta(days=30) >= min_app_date else min_app_date
+    default_end = max_app_date
 
     with col1:
-        fecha_inicio = st.date_input("Fecha de Inicio del Reporte", min_date)
+        fecha_inicio = st.date_input("Fecha de Inicio del Reporte", default_start, min_value=min_app_date, max_value=max_app_date)
     with col2:
-        fecha_fin = st.date_input("Fecha de Fin del Reporte", max_date)
+        fecha_fin = st.date_input("Fecha de Fin del Reporte", default_end, min_value=min_app_date, max_value=max_app_date)
 
     if st.button("Generar Reporte"):
         if fecha_inicio > fecha_fin:
             st.error("La fecha de inicio no puede ser posterior a la fecha de fin.")
             return
 
-        # Asegurar que las fechas en los DFs son datetime para el filtro
-        # Coerce errors para manejar fechas no válidas si las hubiera
-        df_consumo_dt = st.session_state.df_consumo.copy()
-        df_consumo_dt['Fecha'] = pd.to_datetime(df_consumo_dt['Fecha'], errors='coerce').dropna()
+        # Ensure date columns in the DFs being filtered are datetime objects for robust comparison
+        # Filter needs pd.Timestamp for comparison, not date objects directly sometimes
+        df_consumo_temp = st.session_state.df_consumo.copy()
+        if 'Fecha' in df_consumo_temp.columns:
+             df_consumo_temp['Fecha'] = pd.to_datetime(df_consumo_temp['Fecha'], errors='coerce').dropna()
 
-        df_precios_dt = st.session_state.df_precios_combustible.copy()
-        df_precios_dt['Fecha'] = pd.to_datetime(df_precios_dt['Fecha'], errors='coerce').dropna()
+        df_precios_temp = st.session_state.df_precios_combustible.copy()
+        if 'Fecha' in df_precios_temp.columns:
+             df_precios_temp['Fecha'] = pd.to_datetime(df_precios_temp['Fecha'], errors='coerce').dropna()
 
-        df_salarial_dt = st.session_state.df_costos_salarial.copy()
-        df_salarial_dt['Fecha'] = pd.to_datetime(df_salarial_dt['Fecha'], errors='coerce').dropna()
+        df_salarial_temp = st.session_state.df_costos_salarial.copy()
+        if 'Fecha' in df_salarial_temp.columns:
+             df_salarial_temp['Fecha'] = pd.to_datetime(df_salarial_temp['Fecha'], errors='coerce').dropna()
 
-        df_fijos_dt = st.session_state.df_gastos_fijos.copy()
-        df_fijos_dt['Fecha'] = pd.to_datetime(df_fijos_dt['Fecha'], errors='coerce').dropna()
+        df_fijos_temp = st.session_state.df_gastos_fijos.copy()
+        if 'Fecha' in df_fijos_temp.columns:
+             df_fijos_temp['Fecha'] = pd.to_datetime(df_fijos_temp['Fecha'], errors='coerce').dropna()
 
-        df_mantenimiento_dt = st.session_state.df_gastos_mantenimiento.copy()
-        df_mantenimiento_dt['Fecha'] = pd.to_datetime(df_mantenimiento_dt['Fecha'], errors='coerce').dropna()
+        df_mantenimiento_temp = st.session_state.df_gastos_mantenimiento.copy()
+        if 'Fecha' in df_mantenimiento_temp.columns:
+             df_mantenimiento_temp['Fecha'] = pd.to_datetime(df_mantenimiento_temp['Fecha'], errors='coerce').dropna()
 
 
-        # Filtrar por fecha
-        df_consumo_filtrado = df_consumo_dt[(df_consumo_dt['Fecha'] >= pd.to_datetime(fecha_inicio)) & (df_consumo_dt['Fecha'] <= pd.to_datetime(fecha_fin))].copy()
-        salarial_filtrado = df_salarial_dt[(df_salarial_dt['Fecha'] >= pd.to_datetime(fecha_inicio)) & (df_salarial_dt['Fecha'] <= pd.to_datetime(fecha_fin))].copy()
-        fijos_filtrado = df_fijos_dt[(df_fijos_dt['Fecha'] >= pd.to_datetime(fecha_inicio)) & (df_fijos_dt['Fecha'] <= pd.to_datetime(fecha_fin))].copy()
-        mantenimiento_filtrado = df_mantenimiento_dt[(df_mantenimiento_dt['Fecha'] >= pd.to_datetime(fecha_inicio)) & (df_mantenimiento_dt['Fecha'] <= pd.to_datetime(fecha_fin))].copy()
+        # Filtrar por fecha (using pd.Timestamp for comparisons)
+        start_ts = pd.to_datetime(fecha_inicio)
+        end_ts = pd.to_datetime(fecha_fin)
+
+        df_consumo_filtrado = df_consumo_temp[(df_consumo_temp['Fecha'] >= start_ts) & (df_consumo_temp['Fecha'] <= end_ts)].copy()
+        precios_filtrado = df_precios_temp[(df_precios_temp['Fecha'] >= start_ts) & (df_precios_temp['Fecha'] <= end_ts)].copy()
+        salarial_filtrado = df_salarial_temp[(df_salarial_temp['Fecha'] >= start_ts) & (df_salarial_temp['Fecha'] <= end_ts)].copy()
+        fijos_filtrado = df_fijos_temp[(df_fijos_temp['Fecha'] >= start_ts) & (df_fijos_temp['Fecha'] <= end_ts)].copy()
+        mantenimiento_filtrado = df_mantenimiento_temp[(df_mantenimiento_temp['Fecha'] >= start_ts) & (df_mantenimiento_temp['Fecha'] <= end_ts)].copy()
 
 
         if df_consumo_filtrado.empty:
             st.info("No hay datos de consumo en el rango de fechas seleccionado.")
-            # Mostrar otros costos si existen, incluso sin consumo
-            # return # No retornamos aquí para mostrar al menos los costos
+            # We continue to show other costs if they exist
+            reporte_resumen_consumo = pd.DataFrame(columns=['Interno', 'Costo_Total_Combustible']) # Empty DF for later merge
+        else:
+             # Calcular métricas por equipo y fecha en el periodo
+             df_consumo_filtrado['Consumo_L_H'] = df_consumo_filtrado.apply(
+                 lambda row: row['Consumo_Litros'] / row['Horas_Trabajadas'] if row['Horas_Trabajadas'] > 0 else 0, axis=1
+             )
+             df_consumo_filtrado['Consumo_L_KM'] = df_consumo_filtrado.apply(
+                  lambda row: row['Consumo_Litros'] / row['Kilometros_Recorridos'] if row['Kilometros_Recorridos'] > 0 else 0, axis=1
+             )
 
-        # Calcular métricas por equipo y fecha en el periodo
-        df_consumo_filtrado['Consumo_L_H'] = df_consumo_filtrado.apply(
-            lambda row: row['Consumo_Litros'] / row['Horas_Trabajadas'] if row['Horas_Trabajadas'] > 0 else 0, axis=1
-        )
-        df_consumo_filtrado['Consumo_L_KM'] = df_consumo_filtrado.apply(
-             lambda row: row['Consumo_Litros'] / row['Kilometros_Recorridos'] if row['Kilometros_Recorridos'] > 0 else 0, axis=1
-        )
+             # Unir con precios de combustible (usando el precio más reciente antes o en la fecha de consumo)
+             # Ensure dates are sorted datetime for merge_asof
+             consumo_for_merge = df_consumo_filtrado.sort_values('Fecha')
+             precios_for_merge = precios_filtrado.sort_values('Fecha')
 
-        # Unir con precios de combustible (usando el precio más reciente antes o en la fecha de consumo)
-        df_precios_dt_sorted = df_precios_dt.sort_values('Fecha')
-
-        # Merge asof para unir cada fecha de consumo con el precio de combustible más reciente <= a esa fecha
-        # Asegurarse de que 'Fecha' sea el índice o columna para merge_asof
-        if not df_consumo_filtrado.empty:
+             # merge_asof requires 'Fecha' to be datetime, which df_..._temp are
              reporte_consumo = pd.merge_asof(
-                 df_consumo_filtrado.sort_values('Fecha'),
-                 df_precios_dt_sorted,
+                 consumo_for_merge,
+                 precios_for_merge,
                  on='Fecha',
-                 by='Interno' if 'Interno' in df_precios_dt_sorted.columns else None, # Intenta unir por Interno si es posible (precio por equipo)
+                 by='Interno' if 'Interno' in precios_for_merge.columns else None, # Intenta unir por Interno si es posible (precio por equipo)
                  direction='backward'
              )
              # Calcular costo del combustible
-             reporte_consumo['Costo_Combustible'] = reporte_consumo['Consumo_Litros'] * reporte_consumo['Precio_Litro'].fillna(0) # Si no hay precio, costo es 0
+             reporte_consumo['Costo_Combustible'] = reporte_consumo['Consumo_Litros'] * reporte_consumo['Precio_Litro'].fillna(0) # If no price, cost is 0
+
              # Resumen de Consumo y Costo Combustible por Equipo en el período
              reporte_resumen_consumo = reporte_consumo.groupby('Interno').agg(
                  Total_Consumo_Litros=('Consumo_Litros', 'sum'),
@@ -550,7 +708,7 @@ def page_reportes_mina():
                   lambda row: row['Total_Consumo_Litros'] / row['Total_Horas'] if row['Total_Horas'] > 0 else 0, axis=1
              )
              reporte_resumen_consumo['Avg_Consumo_L_KM'] = reporte_resumen_consumo.apply(
-                  lambda row: row['Total_Consumo_Litros'] / row['Total_Kilometros'] if row['Total_Kilometros'] > 0 else 0, axis=1
+                  lambda row: row['Total_Consumo_Litros'] / row['Total_Kilometros'] if row['Kilometros_Recorridos'] > 0 else 0, axis=1
              )
 
              # Unir con información de equipos (Patente)
@@ -561,9 +719,7 @@ def page_reportes_mina():
                  'Interno', 'Patente', 'Total_Consumo_Litros', 'Total_Horas', 'Total_Kilometros',
                  'Avg_Consumo_L_H', 'Avg_Consumo_L_KM', 'Costo_Total_Combustible'
              ]].round(2))
-        else:
-             st.info("No hay datos de consumo para calcular L/H, L/KM o costo de combustible en este período.")
-             reporte_resumen_consumo = pd.DataFrame(columns=['Interno', 'Costo_Total_Combustible']) # DataFrame vacío para el merge posterior
+
 
         # --- Sumar otros costos (Salarial, Fijos, Mantenimiento) en el periodo ---
         # Agrupar por Interno
@@ -574,14 +730,14 @@ def page_reportes_mina():
         # Unir todos los costos
         # Empezar con la lista única de equipos que tuvieron ALGÚN costo o consumo en el periodo
         all_internos_in_period = pd.concat([
-            df_consumo_filtrado['Interno'],
-            salarial_filtrado['Interno'],
-            fijos_filtrado['Interno'],
-            mantenimiento_filtrado['Interno']
+            df_consumo_filtrado['Interno'] if not df_consumo_filtrado.empty else pd.Series(dtype='object'),
+            salarial_filtrado['Interno'] if not salarial_filtrado.empty else pd.Series(dtype='object'),
+            fijos_filtrado['Interno'] if not fijos_filtrado.empty else pd.Series(dtype='object'),
+            mantenimiento_filtrado['Interno'] if not mantenimiento_filtrado.empty else pd.Series(dtype='object')
         ]).unique()
         df_all_internos = pd.DataFrame(all_internos_in_period, columns=['Interno'])
 
-        reporte_costo_total = df_all_internos.merge(reporte_resumen_consum[['Interno', 'Costo_Total_Combustible']], on='Interno', how='left').fillna(0)
+        reporte_costo_total = df_all_internos.merge(reporte_resumen_consumo[['Interno', 'Costo_Total_Combustible']], on='Interno', how='left').fillna(0)
         reporte_costo_total = reporte_costo_total.merge(salarial_agg, on='Interno', how='left').fillna(0)
         reporte_costo_total = reporte_costo_total.merge(fijos_agg, on='Interno', how='left').fillna(0)
         reporte_costo_total = reporte_costo_total.merge(mantenimiento_agg, on='Interno', how='left').fillna(0)
@@ -594,7 +750,7 @@ def page_reportes_mina():
 
         st.subheader(f"Reporte Costo Total por Equipo ({fecha_inicio} a {fecha_fin})")
         if reporte_costo_total.empty:
-             st.info("No hay datos de costos (Combustible, Salarial, Fijos, Mantenimiento) en el rango de fechas seleccionado.")
+             st.info("No hay datos de costos (Combustible, Salarial, Fijos, Mantenimiento) en el rango de fechas seleccionado para ningún equipo.")
         else:
              st.dataframe(reporte_costo_total[[
                  'Interno', 'Patente', 'Costo_Total_Combustible', 'Total_Salarial',
@@ -610,10 +766,14 @@ def page_variacion_costos_flota():
     col1, col2, col3, col4 = st.columns(4)
     # Intentar establecer fechas por defecto basadas en datos si existen
     all_cost_dates = pd.to_datetime([]).date # Empty date series
-    if not st.session_state.df_consumo.empty: all_cost_dates = all_cost_dates.union(pd.to_datetime(st.session_state.df_consumo['Fecha']).dt.date)
-    if not st.session_state.df_costos_salarial.empty: all_cost_dates = all_cost_dates.union(pd.to_datetime(st.session_state.df_costos_salarial['Fecha']).dt.date)
-    if not st.session_state.df_gastos_fijos.empty: all_cost_dates = all_cost_dates.union(pd.to_datetime(st.session_state.df_gastos_fijos['Fecha']).dt.date)
-    if not st.session_state.df_gastos_mantenimiento.empty: all_cost_dates = all_cost_dates.union(pd.to_datetime(st.session_state.df_gastos_mantenimiento['Fecha']).dt.date)
+    df_list_for_dates = [st.session_state.df_consumo, st.session_state.df_costos_salarial, st.session_state.df_gastos_fijos, st.session_state.df_gastos_mantenimiento, st.session_state.df_precios_combustible]
+    date_cols_list = [['Fecha'], ['Fecha'], ['Fecha'], ['Fecha'], ['Fecha']]
+
+    for df, cols in zip(df_list_for_dates, date_cols_list):
+        if not df.empty and cols and cols[0] in df.columns: # Check if df not empty and date column exists
+            valid_dates = pd.to_datetime(df[cols[0]], errors='coerce').dropna()
+            if not valid_dates.empty:
+                 all_cost_dates = all_cost_dates.union(valid_dates.dt.date)
 
     if not all_cost_dates.empty:
         min_app_date = min(all_cost_dates)
@@ -624,9 +784,18 @@ def page_variacion_costos_flota():
         default_end_p1 = default_start_p2 - pd.Timedelta(days=1)
         default_start_p1 = default_end_p1 - pd.Timedelta(days=30)
 
+        # Ensure default dates are within the min/max range
+        default_start_p1 = max(default_start_p1, min_app_date)
+        default_end_p1 = max(default_end_p1, min_app_date) # Ensure end is not before min
+        default_start_p2 = max(default_start_p2, min_app_date)
+        default_end_p2 = max(default_end_p2, min_app_date)
+
+
     else:
-        min_app_date = pd.Timestamp.now().date() - pd.Timedelta(days=90)
-        max_app_date = pd.Timestamp.now().date()
+        # Fallback if no data dates exist
+        today = pd.Timestamp.now().date()
+        min_app_date = today - pd.Timedelta(days=365)
+        max_app_date = today
         default_end_p2 = max_app_date
         default_start_p2 = default_end_p2 - pd.Timedelta(days=30)
         default_end_p1 = default_start_p2 - pd.Timedelta(days=1)
@@ -644,21 +813,26 @@ def page_variacion_costos_flota():
 
 
     if st.button("Generar Gráfico de Cascada"):
-        if fecha_inicio_p1 >= fecha_fin_p1 or fecha_inicio_p2 >= fecha_fin_p2:
+        # Basic date validation
+        if fecha_inicio_p1 > fecha_fin_p1 or fecha_inicio_p2 > fecha_fin_p2:
              st.error("Las fechas dentro de cada período no son válidas.")
              return
-        if fecha_fin_p1 >= fecha_inicio_p2:
-             st.warning("Los períodos se solapan o son adyacentes. Considere usar rangos no solapados para una mejor visualización de la variación.")
-             # return # Allow generating but warn
+        # Optional: Warning for overlapping periods
+        if not (fecha_fin_p1 < fecha_inicio_p2 or fecha_fin_p2 < fecha_inicio_p1):
+             st.warning("Los períodos seleccionados se solapan. Para una comparación clara de la variación, es recomendable usar períodos que no se solapen.")
+
 
         # --- Calcular Costos por Período y Categoría ---
         # Helper function to aggregate costs for a given date range
         def aggregate_costs(df, date_col, start_date, end_date):
-            # Ensure date column is datetime and handle errors
-            df_dt = df.copy()
-            df_dt[date_col] = pd.to_datetime(df_dt[date_col], errors='coerce').dropna() # Remove rows with invalid dates
+            # Ensure date column is datetime and handle errors for filtering
+            if date_col not in df.columns:
+                 return pd.DataFrame() # Return empty if date col doesn't exist
+
+            df_temp = df.copy()
+            df_temp[date_col] = pd.to_datetime(df_temp[date_col], errors='coerce').dropna() # Remove rows with invalid dates
             # Filter
-            df_filtered = df_dt[(df_dt[date_col] >= pd.to_datetime(start_date)) & (df_dt[date_col] <= pd.to_datetime(end_date))]
+            df_filtered = df_temp[(df_temp[date_col] >= pd.to_datetime(start_date)) & (df_temp[date_col] <= pd.to_datetime(end_date))]
             return df_filtered
 
         # Costs for Period 1
@@ -671,6 +845,7 @@ def page_variacion_costos_flota():
         # Calculate fuel cost for Period 1
         costo_combustible_p1 = 0
         if not consumo_p1.empty and not precios_p1.empty:
+             # Need to ensure dates are sorted datetime for merge_asof
              consumo_p1_sorted = consumo_p1.sort_values('Fecha')
              precios_p1_sorted = precios_p1.sort_values('Fecha')
              # Merge asof - using date only is likely sufficient for fleet total
@@ -678,9 +853,9 @@ def page_variacion_costos_flota():
              costo_combustible_p1 = (consumo_p1_merged['Consumo_Litros'] * consumo_p1_merged['Precio_Litro'].fillna(0)).sum()
 
 
-        costo_salarial_p1 = salarial_p1['Monto_Salarial'].sum() if not salarial_p1.empty else 0
-        costo_fijos_p1 = fijos_p1['Monto_Gasto_Fijo'].sum() if not fijos_p1.empty else 0
-        costo_mantenimiento_p1 = mantenimiento_p1['Monto_Mantenimiento'].sum() if not mantenimiento_p1.empty else 0
+        costo_salarial_p1 = salarial_p1['Monto_Salarial'].sum() if not salarial_p1.empty and 'Monto_Salarial' in salarial_p1.columns else 0
+        costo_fijos_p1 = fijos_p1['Monto_Gasto_Fijo'].sum() if not fijos_p1.empty and 'Monto_Gasto_Fijo' in fijos_p1.columns else 0
+        costo_mantenimiento_p1 = mantenimiento_p1['Monto_Mantenimiento'].sum() if not mantenimiento_p1.empty and 'Monto_Mantenimiento' in mantenimiento_p1.columns else 0
 
         total_costo_p1 = costo_combustible_p1 + costo_salarial_p1 + costo_fijos_p1 + costo_mantenimiento_p1
 
@@ -699,9 +874,9 @@ def page_variacion_costos_flota():
              consumo_p2_merged = pd.merge_asof(consumo_p2_sorted, precios_p2_sorted, on='Fecha', direction='backward')
              costo_combustible_p2 = (consumo_p2_merged['Consumo_Litros'] * consumo_p2_merged['Precio_Litro'].fillna(0)).sum()
 
-        costo_salarial_p2 = salarial_p2['Monto_Salarial'].sum() if not salarial_p2.empty else 0
-        costo_fijos_p2 = fijos_p2['Monto_Gasto_Fijo'].sum() if not fijos_p2.empty else 0
-        costo_mantenimiento_p2 = mantenimiento_p2['Monto_Mantenimiento'].sum() if not mantenimiento_p2.empty else 0
+        costo_salarial_p2 = salarial_p2['Monto_Salarial'].sum() if not salarial_p2.empty and 'Monto_Salarial' in salarial_p2.columns else 0
+        costo_fijos_p2 = fijos_p2['Monto_Gasto_Fijo'].sum() if not fijos_p2.empty and 'Monto_Gasto_Fijo' in fijos_p2.columns else 0
+        costo_mantenimiento_p2 = mantenimiento_p2['Monto_Mantenimiento'].sum() if not mantenimiento_p2.empty and 'Monto_Mantenimiento' in mantenimiento_p2.columns else 0
 
         total_costo_p2 = costo_combustible_p2 + costo_salarial_p2 + costo_fijos_p2 + costo_mantenimiento_p2
 
@@ -720,25 +895,28 @@ def page_variacion_costos_flota():
         variacion_mantenimiento = costo_mantenimiento_p2 - costo_mantenimiento_p1
 
         # Añadir variaciones (solo si hay alguna diferencia significativa)
-        if abs(variacion_combustible) > 0.01: # Usar umbral pequeño para evitar variaciones insignificantes
+        # Use a slightly larger threshold for display purposes maybe? 10 or 100?
+        threshold = 0.01 # Keep small threshold for calculation accuracy
+
+        if abs(variacion_combustible) > threshold:
             labels.append('Variación Combustible')
             measures.append('relative')
             values.append(variacion_combustible)
             texts.append(f"${variacion_combustible:,.2f}")
 
-        if abs(variacion_salarial) > 0.01:
+        if abs(variacion_salarial) > threshold:
             labels.append('Variación Salarial')
             measures.append('relative')
             values.append(variacion_salarial)
             texts.append(f"${variacion_salarial:,.2f}")
 
-        if abs(variacion_fijos) > 0.01:
+        if abs(variacion_fijos) > threshold:
             labels.append('Variación Fijos')
             measures.append('relative')
             values.append(variacion_fijos)
             texts.append(f"${variacion_fijos:,.2f}")
 
-        if abs(variacion_mantenimiento) > 0.01:
+        if abs(variacion_mantenimiento) > threshold:
             labels.append('Variación Mantenimiento')
             measures.append('relative')
             values.append(variacion_mantenimiento)
@@ -752,8 +930,8 @@ def page_variacion_costos_flota():
 
 
         # --- Crear Gráfico de Cascada ---
-        if len(labels) <= 1: # Only the starting point
-             st.info("No hay datos o variación significativa para mostrar el gráfico de cascada en los períodos seleccionados.")
+        if len(labels) <= 1: # Only the starting point (Total Period 1) means no variation or Period 2 exists
+             st.info("No hay datos de costos o la variación entre los períodos es insignificante para mostrar el gráfico de cascada.")
         else:
              fig = go.Figure(go.Waterfall(
                  name = "Variación de Costos",
@@ -767,7 +945,7 @@ def page_variacion_costos_flota():
              ))
 
              fig.update_layout(
-                 title = f'Variación de Costos de Flota: {fecha_inicio_p1}-{fecha_fin_p1} vs {fecha_inicio_p2}-{fecha_fin_p2}',
+                 title = f'Variación de Costos de Flota: {fecha_inicio_p1} a {fecha_fin_p1} vs {fecha_inicio_p2} a {fecha_fin_p2}',
                  showlegend = False,
                  yaxis_title="Monto ($)",
                  margin=dict(l=20, r=20, t=100, b=20), # Ajustar márgenes para el título largo
@@ -793,7 +971,7 @@ def page_variacion_costos_flota():
             st.write(f"- Mantenimiento: ${costo_mantenimiento_p2:,.2f}")
             st.write(f"**Total Periodo 2: ${total_costo_p2:,.2f}**")
 
-        if total_costo_p1 != total_costo_p2:
+        if abs(total_costo_p1 - total_costo_p2) > threshold:
             st.subheader("Variaciones Absolutas")
             st.write(f"- Combustible: ${variacion_combustible:,.2f}")
             st.write(f"- Salarial: ${variacion_salarial:,.2f}")
@@ -801,7 +979,7 @@ def page_variacion_costos_flota():
             st.write(f"- Mantenimiento: ${variacion_mantenimiento:,.2f}")
             st.write(f"**Variación Total: ${total_costo_p2 - total_costo_p1:,.2f}**")
         else:
-             st.info("Los costos totales entre los dos períodos son iguales.")
+             st.info("Los costos totales entre los dos períodos son iguales o la variación es insignificante.")
 
 
 def page_gestion_obras():
@@ -816,10 +994,11 @@ def page_gestion_obras():
         if submitted:
             if nombre_obra and responsable:
                 # Generar ID único simple (usando timestamp + contador para evitar colisiones si se crean rápido)
-                id_obra = f"OBRA_{int(pd.Timestamp.now().timestamp())}_{len(st.session_state.df_proyectos)}"
+                # Use nanoseconds for higher chance of uniqueness if many created quickly
+                id_obra = f"OBRA_{int(pd.Timestamp.now().timestamp() * 1e9)}_{len(st.session_state.df_proyectos)}"
                 new_obra = pd.DataFrame([{'ID_Obra': id_obra, 'Nombre_Obra': nombre_obra, 'Responsable': responsable}])
                 st.session_state.df_proyectos = pd.concat([st.session_state.df_proyectos, new_obra], ignore_index=True)
-                save_data(st.session_state.df_proyectos, FILE_PROYECTOS)
+                save_table(st.session_state.df_proyectos, DATABASE_FILE, TABLE_PROYECTOS) # Save to DB
                 st.success(f"Obra '{nombre_obra}' creada con ID: {id_obra}")
             else:
                 st.warning("Por favor, complete el Nombre de la Obra y el Responsable.")
@@ -840,6 +1019,7 @@ def page_gestion_obras():
                   "Responsable": st.column_config.TextColumn("Responsable", required=True)
              }
         )
+        # Check if any row was deleted or added, or if content changed
         if not df_proyectos_edited.equals(st.session_state.df_proyectos):
              st.session_state.df_proyectos = df_proyectos_edited
              if st.button("Guardar Cambios en Lista de Obras"):
@@ -847,14 +1027,22 @@ def page_gestion_obras():
                  if st.session_state.df_proyectos['Nombre_Obra'].isnull().any() or st.session_state.df_proyectos['Responsable'].isnull().any():
                       st.error("Error: Los campos 'Nombre Obra' y 'Responsable' no pueden estar vacíos.")
                  else:
-                      save_data(st.session_state.df_proyectos, FILE_PROYECTOS)
+                      save_table(st.session_state.df_proyectos, DATABASE_FILE, TABLE_PROYECTOS) # Save to DB
                       st.success("Cambios en la lista de obras guardados.")
+                      st.experimental_rerun() # Recargar para actualizar selectbox y otros elementos dependientes
              else:
                  st.info("Hay cambios sin guardar en la lista de obras.")
 
+        # Ensure obras_disponibles is populated after potential saves/deletions
+        obras_disponibles = st.session_state.df_proyectos['ID_Obra'].tolist()
+        if not obras_disponibles:
+             st.warning("No hay obras disponibles para gestionar presupuesto.")
+             return # Exit function if no works exist after potential edits
+
+
         st.markdown("---")
         st.subheader("Gestionar Presupuesto por Obra")
-        obras_disponibles = st.session_state.df_proyectos['ID_Obra'].tolist()
+
         obra_seleccionada_id = st.selectbox(
             "Seleccione una Obra:",
             obras_disponibles,
@@ -863,6 +1051,15 @@ def page_gestion_obras():
         )
 
         if obra_seleccionada_id:
+            # Ensure the selected ID still exists in the updated df_proyectos
+            if obra_seleccionada_id not in st.session_state.df_proyectos['ID_Obra'].values:
+                 st.warning(f"La obra seleccionada (ID: {obra_seleccionada_id}) ya no existe. Por favor, seleccione otra.")
+                 # Consider clearing the selectbox or state related to the selected work
+                 # This can happen if the selected work was just deleted via data_editor
+                 st.session_state.select_obra_gestion = None # Reset selectbox
+                 st.experimental_rerun() # Rerun to clear the state
+                 return # Exit function
+
             obra_nombre = st.session_state.df_proyectos[st.session_state.df_proyectos['ID_Obra'] == obra_seleccionada_id]['Nombre_Obra'].iloc[0]
             st.markdown(f"#### Presupuesto de Materiales para '{obra_nombre}'")
 
@@ -889,17 +1086,19 @@ def page_gestion_obras():
                          }])
                          new_item = calcular_costo_presupuestado(new_item)
                          st.session_state.df_presupuesto_materiales = pd.concat([st.session_state.df_presupuesto_materiales, new_item], ignore_index=True)
-                         save_data(st.session_state.df_presupuesto_materiales, FILE_PRESUPUESTO_MATERIALES)
+                         save_table(st.session_state.df_presupuesto_materiales, DATABASE_FILE, TABLE_PRESUPUESTO_MATERIALES) # Save to DB
                          st.success(f"Material '{material}' añadido al presupuesto de la obra.")
-                         # No need to manually update df_presupuesto_obra here, Streamlit rerun handles it.
+                         st.experimental_rerun() # Rerun to update the data_editor and report
                     else:
                         st.warning("Por favor, complete todos los campos para añadir material.")
 
             # Mostrar y editar presupuesto existente (data_editor)
             st.write("Editar presupuesto existente:")
-            df_presupuesto_obra_editable = df_presupuesto_obra[['Material', 'Cantidad_Presupuestada', 'Precio_Unitario_Presupuestado']].copy() # Solo columnas editables
+            # Only display columns the user should edit
+            df_presupuesto_obra_display = df_presupuesto_obra[['Material', 'Cantidad_Presupuestada', 'Precio_Unitario_Presupuestado']].copy()
+            # data_editor returns a copy, work with that
             df_presupuesto_obra_edited = st.data_editor(
-                df_presupuesto_obra_editable,
+                df_presupuesto_obra_display,
                 key=f"data_editor_presupuesto_{obra_seleccionada_id}",
                 num_rows="dynamic",
                 column_config={
@@ -910,20 +1109,30 @@ def page_gestion_obras():
             )
 
             # Lógica para guardar cambios del data_editor
-            # Comparar con el original filtrado
+            # Compare the edited version (which only has editable columns) with a sliced version of the original
             if not df_presupuesto_obra_edited.equals(df_presupuesto_obra[['Material', 'Cantidad_Presupuestada', 'Precio_Unitario_Presupuestado']]):
                  if st.button(f"Guardar Cambios en Presupuesto de {obra_nombre}"):
-                     # Reconstruir el DataFrame principal para esta obra
+                     # Remove the old rows for this work from the main DataFrame
                      df_rest_presupuesto = st.session_state.df_presupuesto_materiales[
-                         st.session_state.df_presupuesto_materiales['ID_Obra'] != obra_seleccionada_id # Eliminar filas viejas de esta obra
+                         st.session_state.df_presupuesto_materiales['ID_Obra'] != obra_seleccionada_id
                      ].copy()
-                     # Añadir las filas editadas/añadidas (incluyendo la columna ID_Obra)
+
+                     # Add the edited rows (which might include new dynamic rows from data_editor)
+                     # Ensure the ID_Obra column is present for these rows
                      df_presupuesto_obra_edited['ID_Obra'] = obra_seleccionada_id
-                     df_presupuesto_obra_edited = calcular_costo_presupuestado(df_presupuesto_obra_edited) # Recalcular costo total
+                     # Recalculate cost based on edited values
+                     df_presupuesto_obra_edited = calcular_costo_presupuestado(df_presupuesto_obra_edited)
+
+                     # Combine the rest of the data with the updated/edited data for this work
                      st.session_state.df_presupuesto_materiales = pd.concat([df_rest_presupuesto, df_presupuesto_obra_edited], ignore_index=True)
-                     save_data(st.session_state.df_presupuesto_materiales, FILE_PRESUPUESTO_MATERIALES)
-                     st.success("Presupuesto de la obra guardado.")
-                     st.experimental_rerun() # Recargar para actualizar la vista del editor y el reporte
+
+                     # Basic validation before saving
+                     if st.session_state.df_presupuesto_materiales[st.session_state.df_presupuesto_materiales['ID_Obra'] == obra_seleccionada_id]['Material'].isnull().any():
+                          st.error("Error: El nombre del material no puede estar vacío en el presupuesto.")
+                     else:
+                          save_table(st.session_state.df_presupuesto_materiales, DATABASE_FILE, TABLE_PRESUPUESTO_MATERIALES) # Save to DB
+                          st.success("Presupuesto de la obra guardado.")
+                          st.experimental_rerun() # Recargar para actualizar la vista del editor y el reporte
                  else:
                      st.info("Hay cambios sin guardar en el presupuesto de la obra.")
 
@@ -933,10 +1142,12 @@ def page_gestion_obras():
                 st.info("No hay presupuesto de materiales registrado para esta obra.")
             else:
                 st.subheader("Detalle del Presupuesto")
-                st.dataframe(df_presupuesto_obra[['Material', 'Cantidad_Presupuestada', 'Precio_Unitario_Presupuestado', 'Costo_Presupuestado']].round(2))
+                # Ensure calculated cost column is present even if not explicitly added in editor section
+                df_presupuesto_obra_with_cost = calcular_costo_presupuestado(df_presupuesto_obra.copy())
+                st.dataframe(df_presupuesto_obra_with_cost[['Material', 'Cantidad_Presupuestada', 'Precio_Unitario_Presupuestado', 'Costo_Presupuestado']].round(2))
 
-                total_cantidad_presupuestada = df_presupuesto_obra['Cantidad_Presupuestada'].sum()
-                total_costo_presupuestado = df_presupuesto_obra['Costo_Presupuestado'].sum()
+                total_cantidad_presupuestada = df_presupuesto_obra_with_cost['Cantidad_Presupuestada'].sum()
+                total_costo_presupuestado = df_presupuesto_obra_with_cost['Costo_Presupuestado'].sum()
 
                 st.subheader("Resumen del Presupuesto")
                 st.write(f"**Cantidad Total Presupuestada:** {total_cantidad_presupuestada:,.2f}")
@@ -953,13 +1164,16 @@ def page_gestion_obras():
                 st.info("No hay presupuesto ni materiales asignados para esta obra.")
             else:
                # Agrupar presupuesto por material
-               presupuesto_agg = df_presupuesto_obra.groupby('Material').agg(
+               # Use the dataframe that includes the calculated cost
+               presupuesto_agg = df_presupuesto_obra_with_cost.groupby('Material').agg(
                    Cantidad_Presupuestada=('Cantidad_Presupuestada', 'sum'),
                    Costo_Presupuestado=('Costo_Presupuestado', 'sum')
                ).reset_index()
 
                # Agrupar asignaciones por material
-               asignacion_agg = df_asignacion_obra.groupby('Material').agg(
+               # Ensure calculated cost is present in the assignment df
+               df_asignacion_obra_with_cost = calcular_costo_asignado(df_asignacion_obra.copy())
+               asignacion_agg = df_asignacion_obra_with_cost.groupby('Material').agg(
                    Cantidad_Asignada=('Cantidad_Asignada', 'sum'),
                    Costo_Asignado=('Costo_Asignado', 'sum')
                ).reset_index()
@@ -972,45 +1186,48 @@ def page_gestion_obras():
                variacion_obra['Costo_Variacion'] = variacion_obra['Costo_Asignado'] - variacion_obra['Costo_Presupuestado']
 
                st.subheader("Reporte de Variación por Material")
-               st.dataframe(variacion_obra[[
-                   'Material',
-                   'Cantidad_Presupuestada', 'Cantidad_Asignada', 'Cantidad_Variacion',
-                   'Costo_Presupuestado', 'Costo_Asignado', 'Costo_Variacion'
-               ]].round(2))
-
-               total_costo_presupuestado_obra = variacion_obra['Costo_Presupuestado'].sum()
-               total_costo_asignado_obra = variacion_obra['Costo_Asignado'].sum()
-               total_variacion_costo_obra = total_costo_asignado_obra - total_costo_presupuestado_obra
-
-               st.subheader("Resumen de Variación de Costo Total")
-               st.write(f"Costo Presupuestado Total: ${total_costo_presupuestado_obra:,.2f}")
-               st.write(f"Costo Asignado (Real) Total: ${total_costo_asignado_obra:,.2f}")
-               st.write(f"Variación Total: ${total_variacion_costo_obra:,.2f}")
-
-               # Opcional: Gráfico de Cascada para la obra (presupuesto vs asignado)
-               if abs(total_variacion_costo_obra) > 0.01:
-                    st.subheader("Gráfico de Variación de Costo por Obra")
-                    fig_obra_variacion = go.Figure(go.Waterfall(
-                       name = "Variación Obra",
-                       orientation = "v",
-                       measure = ['absolute', 'relative', 'total'],
-                       x = [f'Presupuesto<br>{obra_nombre}', 'Variación Total', f'Asignado<br>{obra_nombre}'],
-                       textposition = "outside",
-                       text = [f"${total_costo_presupuestado_obra:,.2f}", f"${total_variacion_costo_obra:,.2f}", f"${total_costo_asignado_obra:,.2f}"],
-                       y = [total_costo_presupuestado_obra, total_variacion_costo_obra, total_costo_asignado_obra],
-                       connector = {"line":{"color":"rgb(63, 63, 63)"}},
-                    ))
-
-                    fig_obra_variacion.update_layout(
-                        title = f'Variación Costo Total Obra: {obra_nombre}',
-                        showlegend = False,
-                        yaxis_title="Monto ($)",
-                        margin=dict(l=20, r=20, t=60, b=20),
-                        height=400
-                    )
-                    st.plotly_chart(fig_obra_variacion, use_container_width=True)
+               if variacion_obra.empty:
+                    st.info("No hay datos de variación de materiales para esta obra.")
                else:
-                   st.info("El costo presupuestado y asignado para esta obra son iguales.")
+                   st.dataframe(variacion_obra[[
+                       'Material',
+                       'Cantidad_Presupuestada', 'Cantidad_Asignada', 'Cantidad_Variacion',
+                       'Costo_Presupuestado', 'Costo_Asignado', 'Costo_Variacion'
+                   ]].round(2))
+
+                   total_costo_presupuestado_obra = variacion_obra['Costo_Presupuestado'].sum()
+                   total_costo_asignado_obra = variacion_obra['Costo_Asignado'].sum()
+                   total_variacion_costo_obra = total_costo_asignado_obra - total_costo_presupuestado_obra
+
+                   st.subheader("Resumen de Variación de Costo Total")
+                   st.write(f"Costo Presupuestado Total: ${total_costo_presupuestado_obra:,.2f}")
+                   st.write(f"Costo Asignado (Real) Total: ${total_costo_asignado_obra:,.2f}")
+                   st.write(f"Variación Total: ${total_variacion_costo_obra:,.2f}")
+
+                   # Opcional: Gráfico de Cascada para la obra (presupuesto vs asignado)
+                   if abs(total_variacion_costo_obra) > 0.01 or total_costo_presupuestado_obra > 0 or total_costo_asignado_obra > 0: # Only show if there's data or variation
+                        st.subheader("Gráfico de Variación de Costo por Obra")
+                        fig_obra_variacion = go.Figure(go.Waterfall(
+                           name = "Variación Obra",
+                           orientation = "v",
+                           measure = ['absolute', 'relative', 'total'],
+                           x = [f'Presupuesto<br>{obra_nombre}', 'Variación Total', f'Asignado<br>{obra_nombre}'],
+                           textposition = "outside",
+                           text = [f"${total_costo_presupuestado_obra:,.2f}", f"${total_variacion_costo_obra:,.2f}", f"${total_costo_asignado_obra:,.2f}"],
+                           y = [total_costo_presupuestado_obra, total_variacion_costo_obra, total_costo_asignado_obra],
+                           connector = {"line":{"color":"rgb(63, 63, 63)"}},
+                        ))
+
+                        fig_obra_variacion.update_layout(
+                            title = f'Variación Costo Total Obra: {obra_nombre}',
+                            showlegend = False,
+                            yaxis_title="Monto ($)",
+                            margin=dict(l=20, r=20, t=60, b=20),
+                            height=400
+                        )
+                        st.plotly_chart(fig_obra_variacion, use_container_width=True)
+                   else:
+                       st.info("El costo presupuestado y asignado para esta obra son iguales o ambos son cero.")
 
 
 def page_reporte_presupuesto_total_obras():
@@ -1019,35 +1236,34 @@ def page_reporte_presupuesto_total_obras():
 
     if st.session_state.df_presupuesto_materiales.empty:
         st.info("No hay presupuesto de materiales registrado para ninguna obra.")
+        return
+
+    # Asegurar que la columna calculada existe y los datos son numéricos
+    df_presupuesto = st.session_state.df_presupuesto_materiales.copy()
+    df_presupuesto = calcular_costo_presupuestado(df_presupuesto) # Ensure cost is calculated/updated
+
+    # Agrupar por obra
+    reporte_por_obra = df_presupuesto.groupby('ID_Obra').agg(
+        Cantidad_Total_Presupuestada=('Cantidad_Presupuestada', 'sum'),
+        Costo_Total_Presupuestado=('Costo_Presupuestado', 'sum')
+    ).reset_index()
+
+    # Unir con nombres de obras
+    reporte_por_obra = reporte_por_obra.merge(st.session_state.df_proyectos[['ID_Obra', 'Nombre_Obra']], on='ID_Obra', how='left')
+
+    st.subheader("Presupuesto Total por Obra")
+    if reporte_por_obra.empty:
+         st.info("No hay presupuesto total calculado (posiblemente datos de presupuesto no válidos).")
     else:
-        # Asegurar que la columna calculada existe y los datos son numéricos
-        df_presupuesto = st.session_state.df_presupuesto_materiales.copy()
-        df_presupuesto['Cantidad_Presupuestada'] = pd.to_numeric(df_presupuesto['Cantidad_Presupuestada'], errors='coerce').fillna(0)
-        df_presupuesto['Precio_Unitario_Presupuestado'] = pd.to_numeric(df_presupuesto['Precio_Unitario_Presupuestado'], errors='coerce').fillna(0)
-        df_presupuesto = calcular_costo_presupuestado(df_presupuesto)
+         st.dataframe(reporte_por_obra[['Nombre_Obra', 'ID_Obra', 'Cantidad_Total_Presupuestada', 'Costo_Total_Presupuestado']].round(2))
 
-        # Agrupar por obra
-        reporte_por_obra = df_presupuesto.groupby('ID_Obra').agg(
-            Cantidad_Total_Presupuestada=('Cantidad_Presupuestada', 'sum'),
-            Costo_Total_Presupuestado=('Costo_Presupuestado', 'sum')
-        ).reset_index()
+         # Total general
+         cantidad_gran_total = reporte_por_obra['Cantidad_Total_Presupuestada'].sum()
+         costo_gran_total = reporte_por_obra['Costo_Total_Presupuestado'].sum()
 
-        # Unir con nombres de obras
-        reporte_por_obra = reporte_por_obra.merge(st.session_state.df_proyectos[['ID_Obra', 'Nombre_Obra']], on='ID_Obra', how='left')
-
-        st.subheader("Presupuesto Total por Obra")
-        if reporte_por_obra.empty:
-             st.info("No hay presupuesto total calculado (posiblemente datos de presupuesto no válidos).")
-        else:
-             st.dataframe(reporte_por_obra[['Nombre_Obra', 'ID_Obra', 'Cantidad_Total_Presupuestada', 'Costo_Total_Presupuestado']].round(2))
-
-             # Total general
-             cantidad_gran_total = reporte_por_obra['Cantidad_Total_Presupuestada'].sum()
-             costo_gran_total = reporte_por_obra['Costo_Total_Presupuestado'].sum()
-
-             st.subheader("Gran Total Presupuestado (Todas las Obras)")
-             st.write(f"**Cantidad Gran Total Presupuestada:** {cantidad_gran_total:,.2f}")
-             st.write(f"**Costo Gran Total Presupuestado:** ${costo_gran_total:,.2f}")
+         st.subheader("Gran Total Presupuestado (Todas las Obras)")
+         st.write(f"**Cantidad Gran Total Presupuestada:** {cantidad_gran_total:,.2f}")
+         st.write(f"**Costo Gran Total Presupuestado:** ${costo_gran_total:,.2f}")
 
 
 def page_compras_asignacion():
@@ -1067,16 +1283,16 @@ def page_compras_asignacion():
                 id_compra = f"COMPRA_{int(pd.Timestamp.now().timestamp() * 1000)}_{len(st.session_state.df_compras_materiales)}"
                 new_compra = pd.DataFrame([{
                     'ID_Compra': id_compra,
-                    'Fecha_Compra': fecha_compra,
+                    'Fecha_Compra': fecha_compra, # Handled by save_table
                     'Material': material_compra,
                     'Cantidad_Comprada': cantidad_comprada,
                     'Precio_Unitario_Comprado': precio_unitario_comprado
                 }])
-                new_compra['Fecha_Compra'] = pd.to_datetime(new_compra['Fecha_Compra']).dt.date
                 new_compra = calcular_costo_compra(new_compra)
                 st.session_state.df_compras_materiales = pd.concat([st.session_state.df_compras_materiales, new_compra], ignore_index=True)
-                save_data(st.session_state.df_compras_materiales, FILE_COMPRAS_MATERIALES)
+                save_table(st.session_state.df_compras_materiales, DATABASE_FILE, TABLE_COMPRAS_MATERIALES) # Save to DB
                 st.success(f"Compra de '{material_compra}' registrada con ID: {id_compra}")
+                st.experimental_rerun() # Rerun to update the history view and assignment options
             else:
                 st.warning("Por favor, complete todos los campos de la compra.")
 
@@ -1084,10 +1300,17 @@ def page_compras_asignacion():
     if st.session_state.df_compras_materiales.empty:
         st.info("No hay compras registradas aún.")
     else:
-         # Usar data_editor para permitir edición si se desea, o solo mostrar con dataframe
+         # Usar data_editor para permitir edición
          df_compras_editable = st.session_state.df_compras_materiales.copy()
+         # Ensure date is datetime for data_editor
+         if 'Fecha_Compra' in df_compras_editable.columns:
+              df_compras_editable['Fecha_Compra'] = pd.to_datetime(df_compras_editable['Fecha_Compra'])
+         # Recalculate cost for display in editor if needed, or rely on save logic
+         df_compras_editable = calcular_costo_compra(df_compras_editable) # Ensure cost is up-to-date in editor display
+
+
          df_compras_edited = st.data_editor(
-             df_compras_editable[['ID_Compra', 'Fecha_Compra', 'Material', 'Cantidad_Comprada', 'Precio_Unitario_Comprado', 'Costo_Compra']],
+             df_compras_editable[['ID_Compra', 'Fecha_Compra', 'Material', 'Cantidad_Comprada', 'Precio_Unitario_Comprado', 'Costo_Compra']], # Select columns to display/edit
              key="data_editor_compras",
              num_rows="dynamic",
              column_config={
@@ -1096,22 +1319,47 @@ def page_compras_asignacion():
                  "Material": st.column_config.TextColumn("Material", required=True),
                  "Cantidad_Comprada": st.column_config.NumberColumn("Cantidad Comprada", min_value=0.0, format="%.2f", required=True),
                  "Precio_Unitario_Comprado": st.column_config.NumberColumn("Precio Unitario Compra", min_value=0.0, format="%.2f", required=True),
-                 "Costo_Compra": st.column_config.NumberColumn("Costo Compra", disabled=True, format="%.2f") # Calculado, no editable
+                 "Costo_Compra": st.column_config.NumberColumn("Costo Compra", disabled=True, format="%.2f") # Calculated, not editable
              }
          )
          # Lógica de guardado para el editor
+         # Compare the edited version (which only has displayed columns) with a sliced version of the original
          if not df_compras_edited.equals(st.session_state.df_compras_materiales[['ID_Compra', 'Fecha_Compra', 'Material', 'Cantidad_Comprada', 'Precio_Unitario_Comprado', 'Costo_Compra']]):
-             # Necesitamos unir los cambios con el DF original para mantener columnas ocultas o calculadas si las hubiera
-             # Para este caso simple, podemos simplemente actualizar y recalcular el costo
-             st.session_state.df_compras_materiales = df_compras_edited.copy()
-             st.session_state.df_compras_materiales = calcular_costo_compra(st.session_state.df_compras_materiales)
+             # Update the session state DataFrame with the edited data
+             # Need to handle potential new rows from 'dynamic' editor (they won't have ID_Compra initially)
+             # And deleted rows
+             # The simplest approach with 'replace' saving is to just make the edited df the new session state df
+             # Need to re-calculate cost and ensure IDs for new rows if any
+             edited_with_all_cols = df_compras_edited.copy()
+
+             # Re-calculate cost for edited/new rows
+             edited_with_all_cols = calcular_costo_compra(edited_with_all_cols)
+
+             # Handle new rows added via the editor (they won't have an ID_Compra)
+             # Check for rows where ID_Compra is null or empty after editing
+             if edited_with_all_cols['ID_Compra'].isnull().any() or (edited_with_all_cols['ID_Compra'].astype(str) == '').any():
+                  st.warning("Detectadas nuevas filas en el historial de compras sin ID. Se generarán IDs al guardar.")
+                  # Generate IDs only for rows that don't have one
+                  new_row_mask = edited_with_all_cols['ID_Compra'].isnull() | (edited_with_all_cols['ID_Compra'].astype(str) == '')
+                  # Simple ID generation - improve this if truly unique IDs across sessions/runs are critical
+                  # For simplicity with replace, just ensuring it's not empty is sufficient
+                  edited_with_all_cols.loc[new_row_mask, 'ID_Compra'] = [
+                       f"COMPRA_EDIT_{int(pd.Timestamp.now().timestamp() * 1000)}_{i}"
+                       for i in range(new_row_mask.sum())
+                  ]
+
+
+             st.session_state.df_compras_materiales = edited_with_all_cols
 
              if st.button("Guardar Cambios en Historial de Compras"):
-                 # Validar antes de guardar (ej. campos requeridos)
+                 # Validar antes de guardar (ej. campos requeridos, IDs únicos si necessary, though 'replace' handles duplicates by overwriting)
                  if st.session_state.df_compras_materiales['Material'].isnull().any() or st.session_state.df_compras_materiales['Cantidad_Comprada'].isnull().any() or st.session_state.df_compras_materiales['Precio_Unitario_Comprado'].isnull().any():
                       st.error("Error: Hay campos obligatorios vacíos en el historial de compras.")
+                 # Optional: Check for duplicate IDs if you ever plan to merge based on ID after replacement
+                 # elif st.session_state.df_compras_materiales['ID_Compra'].duplicated().any():
+                 #     st.error("Error: Hay IDs de compra duplicados. Por favor, corrija.")
                  else:
-                      save_data(st.session_state.df_compras_materiales, FILE_COMPRAS_MATERIALES)
+                      save_table(st.session_state.df_compras_materiales, DATABASE_FILE, TABLE_COMPRAS_MATERIALES) # Save to DB
                       st.success("Cambios en historial de compras guardados.")
                       st.experimental_rerun() # Opcional: recargar para mostrar el DF actualizado
              else:
@@ -1137,43 +1385,47 @@ def page_compras_asignacion():
                  format_func=lambda x: f"{st.session_state.df_proyectos[st.session_state.df_proyectos['ID_Obra'] == x]['Nombre_Obra'].iloc[0]} (ID: {x})" if not st.session_state.df_proyectos[st.session_state.df_proyectos['ID_Obra'] == x].empty else x,
                  key="asig_obra"
             )
-            # Opción 1: Seleccionar de comprados (más restrictivo pero consistente)
-            # material_asignado = st.selectbox(
-            #     "Material a Asignar:",
-            #     materiales_comprados_unicos if materiales_comprados_unicos else ["(No hay materiales comprados)"],
-            #     disabled=not materiales_comprados_unicos,
-            #     key="asig_material"
-            # )
-            # Opción 2: Texto libre (permite asignar stock inicial o no ligado a compra específica)
-            material_asignado = st.text_input("Material a Asignar").strip()
+            # Option 2: Texto libre (permite asignar stock inicial or not tied to specific purchase)
+            # If you want to use selectbox from purchased:
+            # material_assign_options = materiales_comprados_unicos + ["(Otro / No Comprado)"] # Add option for free text? Or just allow free text.
+            # material_asignado_select = st.selectbox("Material a Asignar:", material_assign_options, key="asig_material_select")
+            # if material_asignado_select == "(Otro / No Comprado)":
+            #      material_asignado = st.text_input("Especificar Material").strip()
+            # else:
+            #      material_asignado = material_asignado_select
+            # Simplest: Just allow free text input for material name
+            material_asignado = st.text_input("Nombre del Material a Asignar").strip()
 
 
             cantidad_asignada = st.number_input("Cantidad a Asignar", min_value=0.0, format="%.2f", key="asig_cantidad")
-            # Precio al que se ASIGNA (puede ser diferente al de compra, ej. costo promedio, o ingreso manual del costo real)
+            # Precio al que se ASIGNA (puede ser diferente al de compra, ej. costo promedio, or ingreso manual del costo real)
             precio_unitario_asignado = st.number_input("Precio Unitario Asignado (Costo Real)", min_value=0.0, format="%.2f", key="asig_precio")
 
             submitted = st.form_submit_button("Asignar Material")
             if submitted:
-                if fecha_asignacion and obra_destino_id and material_asignado and cantidad_asignada >= 0 and precio_unitario_asignado >= 0: # Permitir cantidad 0 para registrar item en 0? No, mejor >0
+                # Check for required fields and valid numeric inputs
+                if fecha_asignacion and obra_destino_id and material_asignado and cantidad_asignada >= 0 and precio_unitario_asignado >= 0:
                      if cantidad_asignada == 0 and precio_unitario_asignado == 0:
-                         st.warning("La cantidad y el precio unitario asignado no pueden ser ambos cero a menos que represente un ítem sin costo/cantidad.")
+                          st.warning("La cantidad y el precio unitario asignado no pueden ser ambos cero si desea registrar una asignación significativa.")
+                     elif obra_destino_id not in st.session_state.df_proyectos['ID_Obra'].values:
+                          st.error(f"El ID de Obra '{obra_destino_id}' seleccionado no es válido. Por favor, seleccione una obra de la lista existente.")
                      else:
                           id_asignacion = f"ASIG_{int(pd.Timestamp.now().timestamp() * 1000)}_{len(st.session_state.df_asignacion_materiales)}" # Simple ID único
                           new_asignacion = pd.DataFrame([{
                               'ID_Asignacion': id_asignacion,
-                              'Fecha_Asignacion': fecha_asignacion,
+                              'Fecha_Asignacion': fecha_asignacion, # Handled by save_table
                               'ID_Obra': obra_destino_id,
                               'Material': material_asignado,
                               'Cantidad_Asignada': cantidad_asignada,
                               'Precio_Unitario_Asignado': precio_unitario_asignado
                           }])
-                          new_asignacion['Fecha_Asignacion'] = pd.to_datetime(new_asignacion['Fecha_Asignacion']).dt.date
                           new_asignacion = calcular_costo_asignado(new_asignacion)
                           st.session_state.df_asignacion_materiales = pd.concat([st.session_state.df_asignacion_materiales, new_asignacion], ignore_index=True)
-                          save_data(st.session_state.df_asignacion_materiales, FILE_ASIGNACION_MATERIALES)
+                          save_table(st.session_state.df_asignacion_materiales, DATABASE_FILE, TABLE_ASIGNACION_MATERIALES) # Save to DB
                           st.success(f"Material '{material_asignado}' ({cantidad_asignada} unidades) asignado a obra '{st.session_state.df_proyectos[st.session_state.df_proyectos['ID_Obra'] == obra_destino_id]['Nombre_Obra'].iloc[0]}'.")
+                          st.experimental_rerun() # Rerun to update history and deshacer list
                 else:
-                    st.warning("Por favor, complete todos los campos de asignación.")
+                    st.warning("Por favor, complete todos los campos de asignación con valores válidos (Cantidad y Precio >= 0).")
 
         st.subheader("Historial de Asignaciones")
         if st.session_state.df_asignacion_materiales.empty:
@@ -1181,6 +1433,13 @@ def page_compras_asignacion():
         else:
             # Usar data_editor para permitir edición si se desea
              df_asignaciones_editable = st.session_state.df_asignacion_materiales.copy()
+             # Ensure date is datetime for data_editor
+             if 'Fecha_Asignacion' in df_asignaciones_editable.columns:
+                  df_asignaciones_editable['Fecha_Asignacion'] = pd.to_datetime(df_asignaciones_editable['Fecha_Asignacion'])
+             # Ensure cost is up-to-date in editor display
+             df_asignaciones_editable = calcular_costo_asignado(df_asignaciones_editable)
+
+
              df_asignaciones_edited = st.data_editor(
                  df_asignaciones_editable[['ID_Asignacion', 'Fecha_Asignacion', 'ID_Obra', 'Material', 'Cantidad_Asignada', 'Precio_Unitario_Asignado', 'Costo_Asignado']],
                  key="data_editor_asignaciones",
@@ -1188,7 +1447,7 @@ def page_compras_asignacion():
                   column_config={
                       "ID_Asignacion": st.column_config.TextColumn("ID Asignación", disabled=True),
                       "Fecha_Asignacion": st.column_config.DateColumn("Fecha Asignación", required=True),
-                      "ID_Obra": st.column_config.TextColumn("ID Obra", required=True), # Podría ser selectbox si solo se asigna a obras existentes
+                      "ID_Obra": st.column_config.TextColumn("ID Obra", required=True),
                       "Material": st.column_config.TextColumn("Material", required=True),
                       "Cantidad_Asignada": st.column_config.NumberColumn("Cantidad Asignada", min_value=0.0, format="%.2f", required=True),
                       "Precio_Unitario_Asignado": st.column_config.NumberColumn("Precio Unitario Asignado", min_value=0.0, format="%.2f", required=True),
@@ -1196,62 +1455,80 @@ def page_compras_asignacion():
                   }
              )
              # Lógica de guardado para el editor
+             # Compare the edited version with a sliced version of the original
              if not df_asignaciones_edited.equals(st.session_state.df_asignacion_materiales[['ID_Asignacion', 'Fecha_Asignacion', 'ID_Obra', 'Material', 'Cantidad_Asignada', 'Precio_Unitario_Asignado', 'Costo_Asignado']]):
-                  st.session_state.df_asignacion_materiales = df_asignaciones_edited.copy()
-                  st.session_state.df_asignacion_materiales = calcular_costo_asignado(st.session_state.df_asignacion_materiales)
+                  edited_with_all_cols = df_asignaciones_edited.copy()
+
+                  # Re-calculate cost for edited/new rows
+                  edited_with_all_cols = calcular_costo_asignado(edited_with_all_cols)
+
+                  # Handle new rows added via the editor (they won't have an ID_Asignacion)
+                  if edited_with_all_cols['ID_Asignacion'].isnull().any() or (edited_with_all_cols['ID_Asignacion'].astype(str) == '').any():
+                       st.warning("Detectadas nuevas filas en el historial de asignaciones sin ID. Se generarán IDs al guardar.")
+                       new_row_mask = edited_with_all_cols['ID_Asignacion'].isnull() | (edited_with_all_cols['ID_Asignacion'].astype(str) == '')
+                       edited_with_all_cols.loc[new_row_mask, 'ID_Asignacion'] = [
+                            f"ASIG_EDIT_{int(pd.Timestamp.now().timestamp() * 1000)}_{i}"
+                            for i in range(new_row_mask.sum())
+                       ]
+
+                  st.session_state.df_asignacion_materiales = edited_with_all_cols
+
                   if st.button("Guardar Cambios en Historial de Asignaciones"):
                       # Validar antes de guardar (ej. campos requeridos, ID_Obra exista)
                       if st.session_state.df_asignacion_materiales['ID_Obra'].isnull().any() or st.session_state.df_asignacion_materiales['Material'].isnull().any() or st.session_state.df_asignacion_materiales['Cantidad_Asignada'].isnull().any() or st.session_state.df_asignacion_materiales['Precio_Unitario_Asignado'].isnull().any():
                            st.error("Error: Hay campos obligatorios vacíos en el historial de asignaciones.")
                       elif not st.session_state.df_asignacion_materiales['ID_Obra'].isin(st.session_state.df_proyectos['ID_Obra']).all():
-                           st.error("Error: Una o más asignaciones tienen un 'ID Obra' que no existe en la lista de obras. Por favor, corrija.")
-                      else:
-                           save_data(st.session_state.df_asignacion_materiales, FILE_ASIGNACION_MATERIALES)
-                           st.success("Cambios en historial de asignaciones guardados.")
-                           st.experimental_rerun()
+                           # Check only IDs that are *not* empty strings or null
+                           invalid_ids = st.session_state.df_asignacion_materiales[
+                               st.session_state.df_asignacion_materiales['ID_Obra'].notna() & (st.session_state.df_asignacion_materiales['ID_Obra'].astype(str) != '')
+                           ]['ID_Obra'].unique()
+
+                           non_existent_ids = [id for id in invalid_ids if id not in st.session_state.df_proyectos['ID_Obra'].values]
+
+                           if non_existent_ids:
+                                st.error(f"Error: Una o más asignaciones tienen un 'ID Obra' que no existe en la lista de obras: {non_existent_ids}. Por favor, corrija.")
+                                # Do not save if there are invalid work IDs
+                                return
+                           else:
+                                # All non-empty work IDs exist
+                                pass # Proceed to save
+
+
+                      save_table(st.session_state.df_asignacion_materiales, DATABASE_FILE, TABLE_ASIGNACION_MATERIALES) # Save to DB
+                      st.success("Cambios en historial de asignaciones guardados.")
+                      st.experimental_rerun()
                   else:
                       st.info("Hay cambios sin guardar en el historial de asignaciones.")
 
-# ... código anterior dentro de page_compras_asignacion() ...
+        st.subheader("Deshacer Asignación (por ID)")
+        asignaciones_disponibles = st.session_state.df_asignacion_materiales['ID_Asignacion'].tolist()
 
-        st.subheader("Historial de Asignaciones")
-        if st.session_state.df_asignacion_materiales.empty:
-            st.info("No hay materiales asignados aún.")
+        if not asignaciones_disponibles:
+            st.info("No hay asignaciones para deshacer.")
         else:
-            # ... código para mostrar el historial de asignaciones (data_editor) ...
+            # Fetch brief info for the selectbox display
+            # Need to handle date objects for formatting
+            df_asig_info = st.session_state.df_asignacion_materiales[['ID_Asignacion', 'Fecha_Asignacion', 'ID_Obra', 'Material', 'Cantidad_Asignada']].copy()
+            if 'Fecha_Asignacion' in df_asig_info.columns:
+                df_asig_info['Fecha_Asignacion'] = pd.to_datetime(df_asig_info['Fecha_Asignacion'], errors='coerce').dt.strftime('%Y-%m-%d').fillna('Fecha Inválida')
 
-            st.subheader("Deshacer Asignación (por ID)")
-            # Esta línea calcula la lista de IDs
-            asignaciones_disponibles = st.session_state.df_asignacion_materiales['ID_Asignacion'].tolist()
+            asig_options_dict = df_asig_info.set_index('ID_Asignacion').to_dict('index')
 
-            # >>>>> LA LÍNEA 1217 ESTÁ AQUÍ <<<<<
-            # Esta línea 'if' debe estar alineada con la línea de arriba
-            if not asignaciones_disponibles:
-                # Este bloque está indentado bajo el 'if'
-                st.info("No hay asignaciones para deshacer.")
-            else:
-                # Este bloque 'else' debe estar alineado con el 'if'
-                # Y el código dentro de este 'else' debe estar indentado bajo él
-                # Mostrar un selectbox con IDs y algo de info
-                asig_options = st.session_state.df_asignacion_materiales[['ID_Asignacion', 'Fecha_Asignacion', 'ID_Obra', 'Material', 'Cantidad_Asignada']].to_dict('records')
-                format_func = lambda x: next((f"{item['ID_Asignacion']} ({item['Fecha_Asignacion']} - {item['ID_Obra']} - {item['Material']} - {item['Cantidad_Asignada']:.2f})", x) for item in asig_options if item['ID_Asignacion'] == x)[0] if x in [item['ID_Asignacion'] for item in asig_options] else x
+            format_func = lambda asig_id: f"{asig_id} ({asig_options_dict.get(asig_id, {}).get('Fecha_Asignacion', 'N/A')} - {asig_options_dict.get(asig_id, {}).get('ID_Obra', 'N/A')} - {asig_options_dict.get(asig_id, {}).get('Material', 'N/A')} - {asig_options_dict.get(asig_id, {}).get('Cantidad_Asignada', 0.0):.2f})" if asig_id in asig_options_dict else asig_id
 
-                id_asignacion_deshacer = st.selectbox(
-                    "Seleccione ID de Asignación a deshacer:",
-                    asignaciones_disponibles,
-                    format_func=format_func
-                )
+            id_asignacion_deshacer = st.selectbox(
+                "Seleccione ID de Asignación a deshacer:",
+                asignaciones_disponibles,
+                format_func=format_func
+            )
 
-                if st.button(f"Deshacer Asignación Seleccionada ({id_asignacion_deshacer})"):
-                    # Este bloque está indentado bajo el 'if' del botón
-                    st.session_state.df_asignacion_materiales = st.session_state.df_asignacion_materiales[
-                        st.session_state.df_asignacion_materiales['ID_Asignacion'] != id_asignacion_deshacer
-                    ]
-                    save_data(st.session_state.df_asignacion_materiales, FILE_ASIGNACION_MATERIALES)
-                    st.success(f"Asignación {id_asignacion_deshacer} deshecha.")
-                    st.experimental_rerun()
-
-# ... resto del código dentro de page_compras_asignacion() ...
+            if st.button(f"Deshacer Asignación Seleccionada ({id_asignacion_deshacer})"):
+                st.session_state.df_asignacion_materiales = st.session_state.df_asignacion_materiales[
+                    st.session_state.df_asignacion_materiales['ID_Asignacion'] != id_asignacion_deshacer
+                ].copy() # Use .copy() to avoid SettingWithCopyWarning later
+                save_table(st.session_state.df_asignacion_materiales, DATABASE_FILE, TABLE_ASIGNACION_MATERIALES) # Save to DB
+                st.success(f"Asignación {id_asignacion_deshacer} deshecha.")
+                st.experimental_rerun()
 
 
 def page_reporte_variacion_total_obras():
@@ -1264,20 +1541,16 @@ def page_reporte_variacion_total_obras():
 
     # Calcular totales presupuestados por obra
     df_presupuesto = st.session_state.df_presupuesto_materiales.copy()
-    # Asegurar numérico y calcular costo
-    df_presupuesto['Cantidad_Presupuestada'] = pd.to_numeric(df_presupuesto['Cantidad_Presupuestada'], errors='coerce').fillna(0)
-    df_presupuesto['Precio_Unitario_Presupuestado'] = pd.to_numeric(df_presupuesto['Precio_Unitario_Presupuestado'], errors='coerce').fillna(0)
-    df_presupuesto = calcular_costo_presupuestado(df_presupuesto)
+    # Ensure numeric and calculate cost
+    df_presupuesto = calcular_costo_presupuestado(df_presupuesto) # Ensure cost is calculated/updated
     presupuesto_total_obra = df_presupuesto.groupby('ID_Obra')['Costo_Presupuestado'].sum().reset_index(name='Costo_Presupuestado_Total')
     presupuesto_cantidad_obra = df_presupuesto.groupby('ID_Obra')['Cantidad_Presupuestada'].sum().reset_index(name='Cantidad_Presupuestada_Total')
 
 
     # Calcular totales asignados por obra
     df_asignacion = st.session_state.df_asignacion_materiales.copy()
-    # Asegurar numérico y calcular costo
-    df_asignacion['Cantidad_Asignada'] = pd.to_numeric(df_asignacion['Cantidad_Asignada'], errors='coerce').fillna(0)
-    df_asignacion['Precio_Unitario_Asignado'] = pd.to_numeric(df_asignacion['Precio_Unitario_Asignado'], errors='coerce').fillna(0)
-    df_asignacion = calcular_costo_asignado(df_asignacion)
+    # Ensure numeric and calculate cost
+    df_asignacion = calcular_costo_asignado(df_asignacion) # Ensure cost is calculated/updated
     asignacion_total_obra = df_asignacion.groupby('ID_Obra')['Costo_Asignado'].sum().reset_index(name='Costo_Asignado_Total')
     asignacion_cantidad_obra = df_asignacion.groupby('ID_Obra')['Cantidad_Asignada'].sum().reset_index(name='Cantidad_Asignada_Total')
 
@@ -1306,14 +1579,14 @@ def page_reporte_variacion_total_obras():
     # Unir con nombres de obras (para mostrar nombres en el reporte)
     reporte_variacion_obras = reporte_variacion_obras.merge(st.session_state.df_proyectos[['ID_Obra', 'Nombre_Obra']], on='ID_Obra', how='left')
 
-    # Calcular variación
+    # Calculate variation
     reporte_variacion_obras['Variacion_Total_Costo'] = reporte_variacion_obras['Costo_Asignado_Total'] - reporte_variacion_obras['Costo_Presupuestado_Total']
     reporte_variacion_obras['Variacion_Total_Cantidad'] = reporte_variacion_obras['Cantidad_Asignada_Total'] - reporte_variacion_obras['Cantidad_Presupuestada_Total']
 
 
     st.subheader("Variación de Costo y Cantidad por Obra (Presupuesto vs Real)")
     if reporte_variacion_obras.empty:
-        st.info("No hay datos válidos para generar el reporte de variación.")
+        st.info("No hay datos válidos para generar el reporte de variación por obra.")
     else:
         st.dataframe(reporte_variacion_obras[[
             'Nombre_Obra', 'ID_Obra',
@@ -1324,8 +1597,10 @@ def page_reporte_variacion_total_obras():
         # --- Gráfico de Cascada Total (Costo) ---
         total_presupuestado_general = reporte_variacion_obras['Costo_Presupuestado_Total'].sum()
         total_asignado_general = reporte_variacion_obras['Costo_Asignado_Total'].sum()
+        total_variacion_general_costo = total_asignado_general - total_presupuestado_general
 
-        if abs(total_asignado_general - total_presupuestado_general) > 0.01 or total_presupuestado_general > 0 or total_asignado_general > 0: # Solo mostrar si hay algo o si hay variación
+
+        if abs(total_variacion_general_costo) > 0.01 or total_presupuestado_general > 0 or total_asignado_general > 0: # Only show if there's something to show
             st.subheader("Gráfico de Cascada: Presupuesto Total vs Costo Real Total")
 
             # Preparar datos para la cascada de COSTO
@@ -1335,11 +1610,16 @@ def page_reporte_variacion_total_obras():
             texts_costo = [f"${total_presupuestado_general:,.2f}"]
 
             # Añadir variaciones por obra (solo costo, solo si hay variación en la obra)
-            # Ordenar por variación para un gráfico más legible
+            # Filter out zero variations for the graph and sort
             reporte_variacion_obras_sorted_costo = reporte_variacion_obras[abs(reporte_variacion_obras['Variacion_Total_Costo']) > 0.01].sort_values('Variacion_Total_Costo', ascending=False)
 
             for index, row in reporte_variacion_obras_sorted_costo.iterrows():
-                 labels_costo.append(f"Var: {row['Nombre_Obra']}")
+                 # Use shorter label for graph if needed
+                 obra_label = row['Nombre_Obra']
+                 if len(obra_label) > 15: # Arbitrary length limit
+                      obra_label = obra_label[:12] + '...'
+                 labels_costo.append(f"Var: {obra_label}") # Use Nombre_Obra in label?
+
                  values_costo.append(row['Variacion_Total_Costo'])
                  measures_costo.append('relative')
                  texts_costo.append(f"${row['Variacion_Total_Costo']:,.2f}")
@@ -1350,8 +1630,8 @@ def page_reporte_variacion_total_obras():
             measures_costo.append('total')
             texts_costo.append(f"${total_asignado_general:,.2f}")
 
-
-            if len(labels_costo) > 1: # Solo dibujar si hay algo más que el punto de inicio
+            # Check again after adding variation bars if there's more than just the start and end points
+            if len(labels_costo) > 2 or (len(labels_costo) == 2 and values_costo[0] != values_costo[1]): # More than just start/end OR start!=end
                 fig_total_variacion_costo = go.Figure(go.Waterfall(
                     name = "Variación Total Costo",
                     orientation = "v",
@@ -1373,7 +1653,7 @@ def page_reporte_variacion_total_obras():
 
                 st.plotly_chart(fig_total_variacion_costo, use_container_width=True)
             else:
-                 st.info("El costo total presupuestado es igual al costo total asignado y ambos son cero. No hay variación de costo para mostrar.")
+                 st.info("El costo total presupuestado es igual al costo total asignado o la variación total es insignificante. No hay variación de costo para mostrar en el gráfico.")
 
         else:
              st.info("No hay costo presupuestado ni asignado total para mostrar el gráfico de variación de costo.")
@@ -1381,8 +1661,9 @@ def page_reporte_variacion_total_obras():
         # --- Gráfico de Cascada Total (Cantidad) ---
         total_cantidad_presupuestada_general = reporte_variacion_obras['Cantidad_Presupuestada_Total'].sum()
         total_cantidad_asignada_general = reporte_variacion_obras['Cantidad_Asignada_Total'].sum()
+        total_variacion_general_cantidad = total_cantidad_asignada_general - total_cantidad_presupuestada_general
 
-        if abs(total_cantidad_asignada_general - total_cantidad_presupuestada_general) > 0.01 or total_cantidad_presupuestada_general > 0 or total_cantidad_asignada_general > 0: # Solo mostrar si hay algo o si hay variación
+        if abs(total_variacion_general_cantidad) > 0.01 or total_cantidad_presupuestada_general > 0 or total_cantidad_asignada_general > 0: # Only show if there's something to show
             st.subheader("Gráfico de Cascada: Cantidad Total Presupuestada vs Cantidad Real Total")
 
             # Preparar datos para la cascada de CANTIDAD
@@ -1392,10 +1673,16 @@ def page_reporte_variacion_total_obras():
             texts_cantidad = [f"{total_cantidad_presupuestada_general:,.2f}"]
 
             # Añadir variaciones por obra (solo cantidad, solo si hay variación en la obra)
+            # Filter out zero variations and sort
             reporte_variacion_obras_sorted_cantidad = reporte_variacion_obras[abs(reporte_variacion_obras['Variacion_Total_Cantidad']) > 0.01].sort_values('Variacion_Total_Cantidad', ascending=False)
 
             for index, row in reporte_variacion_obras_sorted_cantidad.iterrows():
-                 labels_cantidad.append(f"Var Cant: {row['Nombre_Obra']}")
+                 # Use shorter label for graph
+                 obra_label = row['Nombre_Obra']
+                 if len(obra_label) > 15: # Arbitrary length limit
+                      obra_label = obra_label[:12] + '...'
+                 labels_cantidad.append(f"Var Cant: {obra_label}") # Use Nombre_Obra
+
                  values_cantidad.append(row['Variacion_Total_Cantidad'])
                  measures_cantidad.append('relative')
                  texts_cantidad.append(f"{row['Variacion_Total_Cantidad']:,.2f}")
@@ -1406,8 +1693,8 @@ def page_reporte_variacion_total_obras():
             measures_cantidad.append('total')
             texts_cantidad.append(f"{total_cantidad_asignada_general:,.2f}")
 
-
-            if len(labels_cantidad) > 1: # Solo dibujar si hay algo más que el punto de inicio
+            # Check again after adding variation bars if there's more than just the start and end points
+            if len(labels_cantidad) > 2 or (len(labels_cantidad) == 2 and values_cantidad[0] != values_cantidad[1]): # More than just start/end OR start!=end
                 fig_total_variacion_cantidad = go.Figure(go.Waterfall(
                     name = "Variación Total Cantidad",
                     orientation = "v",
@@ -1429,111 +1716,88 @@ def page_reporte_variacion_total_obras():
 
                 st.plotly_chart(fig_total_variacion_cantidad, use_container_width=True)
             else:
-                 st.info("La cantidad total presupuestada es igual a la cantidad total asignada y ambas son cero. No hay variación de cantidad para mostrar.")
+                 st.info("La cantidad total presupuestada es igual a la cantidad total asignada o la variación total es insignificante. No hay variación de cantidad para mostrar en el gráfico.")
         else:
             st.info("No hay cantidad presupuestada ni asignada total para mostrar el gráfico de variación de cantidad.")
 
 
+# --- Main App Logic (No Auth) ---
 
-# --- Main App Logic (Auth and Page Routing) ---
+# The authentication block is removed.
+# The app now proceeds directly to rendering the sidebar and page content.
 
-# Intenta autenticar. El login form aparece en la 'main' area por defecto.
-name, authentication_status, username = authenticator.login('Login', 'main')
+# --- Sidebar Navigation ---
+with st.sidebar:
+    st.title("Menú Principal")
 
-# Verifica el estado de autenticación
-if authentication_status:
-    # --- INICIO DEL BLOQUE DE LA BARRA LATERAL ---
-    # TODO lo que va en la barra lateral DEBE estar dentro de este 'with'
-    with st.sidebar:
-        # Botón de logout
-        # 'main' aquí significa que el botón se alinea con el contenido principal de la sidebar,
-        # no en la parte superior específica de auth (que también se llama 'sidebar' en algunas versiones).
-        # 'Cerrar Sesión' es el texto del botón, 'main' es la ubicación DENTRO de la sidebar.
-        authenticator.logout('Cerrar Sesión', 'sidebar')
+    # Define the pages for navigation
+    pages = {
+        "Dashboard Principal": "dashboard", # Simple placeholder
+        "Gestión de Equipos": "equipos",
+        "Registro de Consumibles": "consumibles",
+        "Registro de Costos Equipos": "costos_equipos",
+        "Reportes Mina (Consumo/Costo)": "reportes_mina",
+        "Variación Costos Flota": "variacion_costos_flota",
+        "--- Gestión de Obras y Materiales ---": None, # Separador (Not a real page key)
+        "Gestión de Obras (Proyectos)": "gestion_obras",
+        "Reporte Presupuesto Total Obras": "reporte_presupuesto_total_obras",
+        "Gestión Compras y Asignación": "compras_asignacion",
+        "Reporte Variación Total Obras": "reporte_variacion_total_obras",
+    }
 
-        st.title(f"Bienvenido, {name}")
-
-        # Definición de las páginas para la navegación
-        # Esto DEBE estar dentro del bloque 'with st.sidebar:'
-        st.header("Navegación")
-        pages = {
-            "Dashboard Principal": "dashboard", # Simple placeholder
-            "Gestión de Equipos": "equipos",
-            "Registro de Consumibles": "consumibles",
-            "Registro de Costos Equipos": "costos_equipos",
-            "Reportes Mina (Consumo/Costo)": "reportes_mina",
-            "Variación Costos Flota": "variacion_costos_flota",
-            "--- Gestión de Obras y Materiales ---": None, # Separador (No es una página real)
-            "Gestión de Obras (Proyectos)": "gestion_obras",
-            "Reporte Presupuesto Total Obras": "reporte_presupuesto_total_obras",
-            "Gestión Compras y Asignación": "compras_asignacion",
-            "Reporte Variación Total Obras": "reporte_variacion_total_obras",
-        }
-
-        # Selector de página (radio button en la sidebar)
-        # Esto DEBE estar dentro del bloque 'with st.sidebar:'
-        selected_page_key = st.radio("Ir a:", list(pages.keys()), index=0)
-        selected_page = pages[selected_page_key]
-
-    # --- FIN DEL BLOQUE DE LA BARRA LATERAL ---
+    # Use a stable key for the radio button
+    selected_page_key = st.radio("Ir a:", list(pages.keys()), index=0, key="main_navigation_radio")
+    selected_page = pages[selected_page_key]
 
 
-    # --- CONTENIDO PRINCIPAL DE LA PÁGINA SELECCIONADA ---
-    # Este código se ejecuta FUERA del bloque 'with st.sidebar:'
-    # Llama a la función de la página seleccionada
-    if selected_page == "dashboard":
-        st.title("Dashboard Principal")
-        st.write(f"Bienvenido {name} al sistema de gestión para la empresa proveedora de minería.")
-        st.info("Seleccione una opción del menú lateral para comenzar.")
-        st.markdown("---")
-        st.subheader("Resumen Rápido")
-        # Aquí podrías agregar métricas clave rápidas
-        total_equipos = len(st.session_state.df_equipos)
-        total_obras = len(st.session_state.df_proyectos)
-        # Asegurar que los cálculos de totales no fallen en DF vacíos
-        total_presupuesto_materiales = calcular_costo_presupuestado(st.session_state.df_presupuesto_materiales.copy())['Costo_Presupuestado'].sum() if not st.session_state.df_presupuesto_materiales.empty else 0
-        total_comprado_materiales = calcular_costo_compra(st.session_state.df_compras_materiales.copy())['Costo_Compra'].sum() if not st.session_state.df_compras_materiales.empty else 0
+# --- Main Content Area based on selection ---
+# This code executes outside the 'with st.sidebar:' block
 
-        col_summary1, col_summary2, col_summary3, col_summary4 = st.columns(4)
-        with col_summary1:
-            st.metric("Total Equipos", total_equipos)
-        with col_summary2:
-             st.metric("Total Obras", total_obras)
-        with col_summary3:
-             st.metric("Presupuesto Materiales Total", f"${total_presupuesto_materiales:,.0f}")
-        with col_summary4:
-             st.metric("Compras Materiales Total", f"${total_comprado_materiales:,.0f}")
+# Call the function of the selected page
+if selected_page == "dashboard":
+    st.title("Dashboard Principal")
+    st.write(f"Bienvenido al sistema de gestión para la empresa proveedora de minería.")
+    st.info("Seleccione una opción del menú lateral para comenzar.")
+    st.markdown("---")
+    st.subheader("Resumen Rápido")
+    # Here you can add quick key metrics
+    total_equipos = len(st.session_state.df_equipos)
+    total_obras = len(st.session_state.df_proyectos)
+    # Ensure cost calculation functions are robust to empty DFs
+    total_presupuesto_materiales = calcular_costo_presupuestado(st.session_state.df_presupuesto_materiales.copy())['Costo_Presupuestado'].sum() if not st.session_state.df_presupuesto_materiales.empty else 0
+    total_comprado_materiales = calcular_costo_compra(st.session_state.df_compras_materiales.copy())['Costo_Compra'].sum() if not st.session_state.df_compras_materiales.empty else 0
 
-
-    elif selected_page == "equipos":
-        page_equipos()
-    elif selected_page == "consumibles":
-        page_consumibles()
-    elif selected_page == "costos_equipos":
-        page_costos_equipos()
-    elif selected_page == "reportes_mina":
-        page_reportes_mina()
-    elif selected_page == "variacion_costos_flota":
-        page_variacion_costos_flota()
-    elif selected_page == "gestion_obras":
-        page_gestion_obras()
-    elif selected_page == "reporte_presupuesto_total_obras":
-        page_reporte_presupuesto_total_obras()
-    elif selected_page == "compras_asignacion":
-        page_compras_asignacion()
-    elif selected_page == "reporte_variacion_total_obras":
-        page_reporte_variacion_total_obras()
-    elif selected_page is None:
-        # Si selected_page es None (para separadores como "---"), no renderizar nada en el área principal
-        st.empty() # Asegurar que el área principal esté vacía
-        # Opcional: mostrar un mensaje genérico si se selecciona un separador
-        # st.info("Seleccione una página válida del menú lateral.")
+    col_summary1, col_summary2, col_summary3, col_summary4 = st.columns(4)
+    with col_summary1:
+        st.metric("Total Equipos", total_equipos)
+    with col_summary2:
+         st.metric("Total Obras", total_obras)
+    with col_summary3:
+         st.metric("Presupuesto Materiales Total", f"${total_presupuesto_materiales:,.0f}")
+    with col_summary4:
+         st.metric("Compras Materiales Total", f"${total_comprado_materiales:,.0f}")
 
 
-# Esto maneja los estados cuando el login NO es exitoso
-elif authentication_status == False:
-    st.error('Usuario/Contraseña incorrecto.')
-elif authentication_status == None:
-    st.warning('Por favor, ingrese su usuario y contraseña.')
-
-# Final del script
+elif selected_page == "equipos":
+    page_equipos()
+elif selected_page == "consumibles":
+    page_consumibles()
+elif selected_page == "costos_equipos":
+    page_costos_equipos()
+elif selected_page == "reportes_mina":
+    page_reportes_mina()
+elif selected_page == "variacion_costos_flota":
+    page_variacion_costos_flota()
+elif selected_page == "gestion_obras":
+    page_gestion_obras()
+elif selected_page == "reporte_presupuesto_total_obras":
+    page_reporte_presupuesto_total_obras()
+elif selected_page == "compras_asignacion":
+    page_compras_asignacion()
+elif selected_page == "reporte_variacion_total_obras":
+    page_reporte_variacion_total_obras()
+elif selected_page is None:
+    # If selected_page is None (for separators like "---"), render a placeholder or nothing
+    st.empty() # Ensure the main area is empty
+    # Optional: show a generic message if a separator is "selected" (though not clickable as a page)
+    # st.info("Seleccione una página válida del menú lateral.")
