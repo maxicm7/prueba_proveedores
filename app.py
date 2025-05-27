@@ -1449,7 +1449,7 @@ if authentication_status:
         # 'main' aquí significa que el botón se alinea con el contenido principal de la sidebar,
         # no en la parte superior específica de auth (que también se llama 'sidebar' en algunas versiones).
         # 'Cerrar Sesión' es el texto del botón, 'main' es la ubicación DENTRO de la sidebar.
-        authenticator.logout('Cerrar Sesión', 'main')
+        authenticator.logout('Cerrar Sesión', 'sidebar')
 
         st.title(f"Bienvenido, {name}")
 
